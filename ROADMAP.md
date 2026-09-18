@@ -9,7 +9,7 @@ Implementation milestones and release versions for the KAI autonomous agent runt
 Establish foundational interfaces, message schemas, and typed error systems. All downstream crates depend on these contracts.
 
 * **Target Crate:** `kai-core`
-* **Status:** In Progress
+* **Status:** Completed
 * **Deliverables:**
   * Base message structs: `Message`, `Role`, `ContentBlock`, `ToolCall`, `ToolResult`.
   * Core traits: `Tool`, `Agent`, `ContextProcessor`, `SessionStore`.
@@ -27,7 +27,7 @@ Establish foundational interfaces, message schemas, and typed error systems. All
 Implement token reduction engines relying strictly on native C/Rust parsing routines.
 
 * **Target Crate:** `kai-context`
-* **Status:** Planned
+* **Status:** Completed
 * **Deliverables:**
   * AST skeleton extractor via `tree-sitter` (Rust, Python, TypeScript/JavaScript grammars).
   * Grep-First search engine wrapping the `ignore` and `regex` crates.
