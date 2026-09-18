@@ -1,0 +1,11 @@
+[package]
+name = "kai-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kai-core.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true

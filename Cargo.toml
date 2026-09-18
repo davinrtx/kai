@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/context",
+    "crates/tools",
+    "crates/orchestrator",
+    "crates/session",
+    "crates/sandbox",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["KAI Contributors"]
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1.38", default-features = false, features = ["rt-multi-thread", "sync", "macros", "time"] }
+thiserror = "1.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+regex = "1.10"
+ignore = "0.4"
+tree-sitter = "0.22"
+
+kai-core = { path = "crates/core" }
+kai-context = { path = "crates/context" }
+kai-tools = { path = "crates/tools" }
+kai-session = { path = "crates/session" }
+kai-sandbox = { path = "crates/sandbox" }
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+
+[profile.test]
+opt-level = 0
+debug = 1

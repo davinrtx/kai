@@ -1,0 +1,9 @@
+[package]
+name = "kai-sandbox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+kai-core.workspace = true
+thiserror.workspace = true
