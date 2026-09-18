@@ -1,0 +1,694 @@
+//! AST skeleton extraction for source code compaction.
+//!
+//! Produces structural outlines of source code (function signatures, type definitions,
+//! classes, and interfaces) while replacing implementation bodies with concise markers
+//! (`{ /* omitted */ }` or `...`), shrinking token footprints by 70–90%.
+
+use kai_core::ContextError;
+
+/// Language-aware AST skeleton extractor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AstSkeleton;
+
+impl AstSkeleton {
+    /// Extracts a structural skeleton based on the file language or extension.
+    ///
+    /// Recognizes `"rust"`, `"python"`, `"typescript"`, `"javascript"`, `"go"`,
+    /// or file extensions like `"rs"`, `"py"`, `"ts"`, `"js"`, `"go"`.
+    /// Falls back to generic signature preservation for unrecognized languages.
+    pub fn extract(code: &str, language: &str) -> String {
+        let lang = language.to_ascii_lowercase();
+        match lang.as_str() {
+            "rust" | "rs" => Self::extract_rust(code),
+            "python" | "py" => Self::extract_python(code),
+            "typescript" | "ts" | "javascript" | "js" => Self::extract_typescript(code),
+            "go" => Self::extract_go(code),
+            _ => Self::extract_generic(code),
+        }
+    }
+
+    /// Extracts structural outline for Rust source files.
+    pub fn extract_rust(code: &str) -> String {
+        let mut result = Vec::new();
+        let mut depth: usize = 0;
+        let mut omit_target_depth: Option<usize> = None;
+        let mut in_fn_signature = false;
+        let mut fn_sig_accumulator = String::new();
+
+        for raw_line in code.lines() {
+            let trimmed = raw_line.trim_start();
+
+            // If we are currently omitting a function body
+            if let Some(target) = omit_target_depth {
+                let (opens, closes) = Self::count_braces_in_line(raw_line);
+                depth = depth.saturating_add(opens).saturating_sub(closes);
+                if depth <= target {
+                    omit_target_depth = None;
+                }
+                continue;
+            }
+
+            // Check if line contains a macro_rules declaration
+            if trimmed.starts_with("macro_rules!") {
+                if let Some(brace_pos) = raw_line.find('{') {
+                    let sig_part = raw_line[..brace_pos].trim_end();
+                    result.push(format!("{} {{ /* omitted */ }}", sig_part));
+                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let initial_depth = depth;
+                    depth = depth.saturating_add(opens).saturating_sub(closes);
+                    if depth > initial_depth {
+                        omit_target_depth = Some(initial_depth);
+                    }
+                    continue;
+                }
+            }
+
+            // Check if line contains a function declaration
+            if !in_fn_signature && Self::is_rust_fn_start(trimmed) {
+                in_fn_signature = true;
+                fn_sig_accumulator.clear();
+            }
+
+            if in_fn_signature {
+                if !fn_sig_accumulator.is_empty() {
+                    fn_sig_accumulator.push('\n');
+                }
+                fn_sig_accumulator.push_str(raw_line);
+
+                if let Some(brace_pos) = fn_sig_accumulator.find('{') {
+                    let sig_part = fn_sig_accumulator[..brace_pos].trim_end();
+                    result.push(format!("{} {{ /* omitted */ }}", sig_part));
+                    in_fn_signature = false;
+                    fn_sig_accumulator.clear();
+
+                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let initial_depth = depth;
+                    depth = depth.saturating_add(opens).saturating_sub(closes);
+                    if depth > initial_depth {
+                        omit_target_depth = Some(initial_depth);
+                    }
+                } else if fn_sig_accumulator.ends_with(';') {
+                    // Trait function or extern without body
+                    result.push(fn_sig_accumulator.clone());
+                    in_fn_signature = false;
+                    fn_sig_accumulator.clear();
+                }
+                continue;
+            }
+
+            // Normal line: update depth and preserve
+            let (opens, closes) = Self::count_braces_in_line(raw_line);
+            depth = depth.saturating_add(opens).saturating_sub(closes);
+            result.push(raw_line.to_string());
+        }
+
+        // Flush any trailing pending signature
+        if in_fn_signature && !fn_sig_accumulator.is_empty() {
+            result.push(fn_sig_accumulator);
+        }
+
+        result.join("\n")
+    }
+
+    /// Extracts structural outline for Python source files.
+    pub fn extract_python(code: &str) -> String {
+        let mut result = Vec::new();
+        let mut in_docstring = false;
+        let mut docstring_delim = "";
+        let mut omit_indent: Option<usize> = None;
+        let mut pending_docstring = false;
+        let mut in_multiline_sig = false;
+        let mut sig_depth: usize = 0;
+        let mut fn_base_indent: usize = 0;
+        let mut sig_accumulator = String::new();
+
+        for raw_line in code.lines() {
+            let trimmed = raw_line.trim_start();
+            let indent = raw_line.len() - trimmed.len();
+
+            // Handle multi-line docstring
+            if in_docstring {
+                result.push(raw_line.to_string());
+                if trimmed.contains(docstring_delim) {
+                    in_docstring = false;
+                }
+                continue;
+            }
+
+            // Multiline signature collection (def foo(\n a,\n b):)
+            if in_multiline_sig {
+                sig_accumulator.push('\n');
+                sig_accumulator.push_str(raw_line);
+                if let Some(colon_pos) = Self::find_python_terminal_colon(raw_line, &mut sig_depth)
+                {
+                    in_multiline_sig = false;
+                    let after_colon = raw_line[colon_pos + 1..].trim();
+                    if !after_colon.is_empty() && !after_colon.starts_with('#') {
+                        result.push(format!("{} ...", sig_accumulator.trim_end()));
+                    } else {
+                        result.push(sig_accumulator.clone());
+                        omit_indent = Some(fn_base_indent);
+                        pending_docstring = true;
+                    }
+                    sig_accumulator.clear();
+                }
+                continue;
+            }
+
+            if trimmed.is_empty() {
+                if omit_indent.is_none() {
+                    result.push(raw_line.to_string());
+                }
+                continue;
+            }
+
+            // Check if we exited omitted block
+            if let Some(target) = omit_indent {
+                if indent <= target {
+                    omit_indent = None;
+                } else {
+                    // Check for docstring immediately following def
+                    if pending_docstring {
+                        if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+                            let delim = if trimmed.starts_with("\"\"\"") {
+                                "\"\"\""
+                            } else {
+                                "'''"
+                            };
+                            result.push(raw_line.to_string());
+                            let rest = &trimmed[3..];
+                            if !rest.contains(delim) {
+                                in_docstring = true;
+                                docstring_delim = delim;
+                            }
+                            pending_docstring = false;
+                            let indent_str = " ".repeat(indent);
+                            result.push(format!("{}...", indent_str));
+                            continue;
+                        }
+                        pending_docstring = false;
+                        let indent_str = " ".repeat(indent);
+                        result.push(format!("{}...", indent_str));
+                    }
+                    continue;
+                }
+            }
+
+            // Preserve Python decorators (@property, @staticmethod, etc.)
+            if trimmed.starts_with('@') {
+                result.push(raw_line.to_string());
+                continue;
+            }
+
+            // Check for class or def declarations
+            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+                fn_base_indent = indent;
+                sig_depth = 0;
+                if let Some(colon_pos) = Self::find_python_terminal_colon(raw_line, &mut sig_depth)
+                {
+                    let after_colon = raw_line[colon_pos + 1..].trim();
+                    if !after_colon.is_empty() && !after_colon.starts_with('#') {
+                        // Single-line function with inline body: def foo(): return 1
+                        let sig = &raw_line[..=colon_pos];
+                        result.push(format!("{} ...", sig));
+                        continue;
+                    }
+
+                    result.push(raw_line.to_string());
+                    omit_indent = Some(fn_base_indent);
+                    pending_docstring = true;
+                } else {
+                    in_multiline_sig = true;
+                    sig_accumulator = raw_line.to_string();
+                }
+            } else {
+                result.push(raw_line.to_string());
+            }
+        }
+
+        if in_multiline_sig && !sig_accumulator.is_empty() {
+            result.push(sig_accumulator);
+        }
+
+        result.join("\n")
+    }
+
+    /// Scans a Python signature fragment, updating nesting depth of `(`, `[`, and `{`.
+    /// Returns Some(colon_byte_index) if the terminal `:` is found at nesting depth 0.
+    fn find_python_terminal_colon(s: &str, depth: &mut usize) -> Option<usize> {
+        let mut in_str = false;
+        let mut str_delim = '\0';
+        let mut prev_char = '\0';
+
+        for (idx, ch) in s.char_indices() {
+            if in_str {
+                if ch == str_delim && prev_char != '\\' {
+                    in_str = false;
+                }
+                prev_char = ch;
+                continue;
+            }
+
+            if ch == '"' || ch == '\'' {
+                in_str = true;
+                str_delim = ch;
+                prev_char = ch;
+                continue;
+            }
+
+            if ch == '#' {
+                break;
+            }
+
+            match ch {
+                '(' | '[' | '{' => *depth += 1,
+                ')' | ']' | '}' => *depth = depth.saturating_sub(1),
+                ':' if *depth == 0 => return Some(idx),
+                _ => {}
+            }
+            prev_char = ch;
+        }
+        None
+    }
+
+    /// Extracts structural outline for TypeScript / JavaScript files.
+    pub fn extract_typescript(code: &str) -> String {
+        let mut result = Vec::new();
+        let mut depth: usize = 0;
+        let mut omit_target_depth: Option<usize> = None;
+        let mut in_fn = false;
+        let mut fn_accumulator = String::new();
+
+        for raw_line in code.lines() {
+            let trimmed = raw_line.trim_start();
+
+            if let Some(target) = omit_target_depth {
+                let (opens, closes) = Self::count_braces_in_line(raw_line);
+                depth = depth.saturating_add(opens).saturating_sub(closes);
+                if depth <= target {
+                    omit_target_depth = None;
+                }
+                continue;
+            }
+
+            if !in_fn && Self::is_ts_fn_start(trimmed) {
+                in_fn = true;
+                fn_accumulator.clear();
+            }
+
+            if in_fn {
+                if !fn_accumulator.is_empty() {
+                    fn_accumulator.push('\n');
+                }
+                fn_accumulator.push_str(raw_line);
+
+                if let Some(brace_pos) = fn_accumulator.find('{') {
+                    let sig_part = fn_accumulator[..brace_pos].trim_end();
+                    result.push(format!("{} {{ /* omitted */ }}", sig_part));
+                    in_fn = false;
+                    fn_accumulator.clear();
+
+                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let initial_depth = depth;
+                    depth = depth.saturating_add(opens).saturating_sub(closes);
+                    if depth > initial_depth {
+                        omit_target_depth = Some(initial_depth);
+                    }
+                } else if fn_accumulator.ends_with(';') {
+                    result.push(fn_accumulator.clone());
+                    in_fn = false;
+                    fn_accumulator.clear();
+                }
+                continue;
+            }
+
+            let (opens, closes) = Self::count_braces_in_line(raw_line);
+            depth = depth.saturating_add(opens).saturating_sub(closes);
+            result.push(raw_line.to_string());
+        }
+
+        result.join("\n")
+    }
+
+    /// Extracts structural outline for Go source files.
+    pub fn extract_go(code: &str) -> String {
+        let mut result = Vec::new();
+        let mut depth: usize = 0;
+        let mut omit_target_depth: Option<usize> = None;
+        let mut in_fn = false;
+        let mut fn_accumulator = String::new();
+
+        for raw_line in code.lines() {
+            let trimmed = raw_line.trim_start();
+
+            if let Some(target) = omit_target_depth {
+                let (opens, closes) = Self::count_braces_in_line(raw_line);
+                depth = depth.saturating_add(opens).saturating_sub(closes);
+                if depth <= target {
+                    omit_target_depth = None;
+                }
+                continue;
+            }
+
+            if !in_fn && trimmed.starts_with("func ") {
+                in_fn = true;
+                fn_accumulator.clear();
+            }
+
+            if in_fn {
+                if !fn_accumulator.is_empty() {
+                    fn_accumulator.push('\n');
+                }
+                fn_accumulator.push_str(raw_line);
+
+                if let Some(brace_pos) = fn_accumulator.find('{') {
+                    let sig_part = fn_accumulator[..brace_pos].trim_end();
+                    result.push(format!("{} {{ /* omitted */ }}", sig_part));
+                    in_fn = false;
+                    fn_accumulator.clear();
+
+                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let initial_depth = depth;
+                    depth = depth.saturating_add(opens).saturating_sub(closes);
+                    if depth > initial_depth {
+                        omit_target_depth = Some(initial_depth);
+                    }
+                }
+                continue;
+            }
+
+            let (opens, closes) = Self::count_braces_in_line(raw_line);
+            depth = depth.saturating_add(opens).saturating_sub(closes);
+            result.push(raw_line.to_string());
+        }
+
+        result.join("\n")
+    }
+
+    /// Fallback extractor for unrecognized languages preserving comments and signatures.
+    pub fn extract_generic(code: &str) -> String {
+        let mut result = Vec::new();
+        for line in code.lines() {
+            let trimmed = line.trim();
+            // Preserve top-level comments, declarations, imports
+            if trimmed.starts_with('#')
+                || trimmed.starts_with("//")
+                || trimmed.starts_with("import")
+                || trimmed.starts_with("from")
+                || trimmed.starts_with("package")
+                || trimmed.contains('{')
+                || trimmed.contains(':')
+            {
+                result.push(line.to_string());
+            }
+        }
+        if result.is_empty() {
+            code.to_string()
+        } else {
+            result.join("\n")
+        }
+    }
+
+    /// Extensible Tree-Sitter parser hook.
+    ///
+    /// Parses `code` into a syntax tree using a supplied [`tree_sitter::Language`].
+    pub fn parse_with_tree_sitter(
+        code: &str,
+        language: &tree_sitter::Language,
+    ) -> Result<tree_sitter::Tree, ContextError> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(language)
+            .map_err(|err| ContextError::AstParsingFailed {
+                language: "custom".to_string(),
+                reason: format!("Failed to configure parser: {:?}", err),
+            })?;
+
+        parser
+            .parse(code, None)
+            .ok_or_else(|| ContextError::AstParsingFailed {
+                language: "custom".to_string(),
+                reason: "Parser produced no syntax tree".to_string(),
+            })
+    }
+
+    /// Checks if a trimmed line starts a Rust function definition.
+    fn is_rust_fn_start(line: &str) -> bool {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        for (i, &token) in tokens.iter().enumerate() {
+            if token == "fn" {
+                return true;
+            }
+            // Only allow valid fn qualifiers before 'fn'
+            if i == 0
+                && !matches!(
+                    token,
+                    "pub"
+                        | "pub(crate)"
+                        | "pub(super)"
+                        | "async"
+                        | "const"
+                        | "unsafe"
+                        | "extern"
+                        | "\"C\""
+                )
+                && !token.starts_with("pub(")
+            {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Checks if a trimmed line starts a TypeScript/JavaScript function or method.
+    fn is_ts_fn_start(line: &str) -> bool {
+        if line.starts_with("function ")
+            || line.starts_with("export function ")
+            || line.starts_with("export default function ")
+            || line.starts_with("async function ")
+            || line.starts_with("export async function ")
+            || line.starts_with("public ")
+            || line.starts_with("private ")
+            || line.starts_with("protected ")
+            || line.starts_with("static ")
+            || line.starts_with("async ")
+            || line.starts_with("constructor(")
+        {
+            return true;
+        }
+
+        // Arrow functions: const myFunc = (...) => {
+        if line.contains("=>")
+            && (line.starts_with("const ")
+                || line.starts_with("let ")
+                || line.starts_with("var ")
+                || line.starts_with("export const "))
+        {
+            return true;
+        }
+
+        // Standard class methods without modifiers: methodName(...) {
+        if let Some(paren_pos) = line.find('(') {
+            let name_part = line[..paren_pos].trim();
+            if !name_part.is_empty()
+                && name_part
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+                && !matches!(name_part, "if" | "for" | "while" | "switch" | "catch")
+                && (line.ends_with('{') || line.contains(") {"))
+            {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Counts open `{` and close `}` in a line while ignoring strings, line comments, and block comments.
+    fn count_braces_in_line(line: &str) -> (usize, usize) {
+        let mut opens = 0usize;
+        let mut closes = 0usize;
+        let mut in_str = false;
+        let mut in_block_comment = false;
+        let mut prev_char = '\0';
+
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if !in_str && !in_block_comment {
+                if ch == '/' && chars.peek() == Some(&'/') {
+                    // Line comment begins, stop scanning line
+                    break;
+                }
+                if ch == '/' && chars.peek() == Some(&'*') {
+                    in_block_comment = true;
+                    chars.next(); // consume '*'
+                    prev_char = '*';
+                    continue;
+                }
+            }
+
+            if in_block_comment {
+                if ch == '*' && chars.peek() == Some(&'/') {
+                    in_block_comment = false;
+                    chars.next(); // consume '/'
+                    prev_char = '/';
+                }
+                continue;
+            }
+
+            if ch == '"' && prev_char != '\\' {
+                in_str = !in_str;
+            } else if !in_str {
+                if ch == '{' {
+                    opens += 1;
+                } else if ch == '}' {
+                    closes += 1;
+                }
+            }
+            prev_char = ch;
+        }
+
+        (opens, closes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rust_skeleton_extraction() {
+        let code = r#"
+pub struct Service {
+    name: String,
+}
+
+impl Service {
+    pub fn new(name: String) -> Self {
+        let validated = name.trim();
+        Self {
+            name: validated.to_string(),
+        }
+    }
+
+    pub fn run(&self) -> bool {
+        println!("Running: {}", self.name);
+        true
+    }
+}
+"#;
+
+        let skeleton = AstSkeleton::extract(code, "rust");
+        assert!(skeleton.contains("pub struct Service"));
+        assert!(skeleton.contains("pub fn new(name: String) -> Self { /* omitted */ }"));
+        assert!(skeleton.contains("pub fn run(&self) -> bool { /* omitted */ }"));
+        assert!(!skeleton.contains("validated.to_string()"));
+    }
+
+    #[test]
+    fn test_rust_macro_extraction() {
+        let code = r#"
+macro_rules! my_macro {
+    ($val:expr) => {
+        println!("{}", $val);
+    };
+}
+"#;
+        let skeleton = AstSkeleton::extract(code, "rust");
+        assert!(skeleton.contains("macro_rules! my_macro { /* omitted */ }"));
+        assert!(!skeleton.contains("println!"));
+    }
+
+    #[test]
+    fn test_python_skeleton_extraction() {
+        let code = r#"
+class Agent:
+    def __init__(self, name: str):
+        """Initialize agent."""
+        self.name = name
+        self.state = {}
+
+    def execute(self, task: str) -> bool:
+        result = task.lower()
+        return True
+
+    def quick_inline(self): return 42
+"#;
+
+        let skeleton = AstSkeleton::extract(code, "python");
+        assert!(skeleton.contains("class Agent:"));
+        assert!(skeleton.contains("def __init__(self, name: str):"));
+        assert!(skeleton.contains("\"\"\"Initialize agent.\"\"\""));
+        assert!(skeleton.contains("def execute(self, task: str) -> bool:"));
+        assert!(skeleton.contains("def quick_inline(self): ..."));
+        assert!(!skeleton.contains("self.state = {}"));
+        assert!(!skeleton.contains("result = task.lower()"));
+    }
+
+    #[test]
+    fn test_python_multiline_typed_signature() {
+        let code = r#"
+class Worker:
+    @property
+    def is_active(self) -> bool:
+        return self._active
+
+    def process(
+        self,
+        items: list[str],
+        timeout: int = 30,
+    ) -> bool:
+        """Process multiple items with timeout."""
+        print("Processing...")
+        return len(items) > 0
+"#;
+        let skeleton = AstSkeleton::extract(code, "python");
+        assert!(skeleton.contains("@property"));
+        assert!(skeleton.contains("def is_active(self) -> bool:"));
+        assert!(skeleton.contains("def process("));
+        assert!(skeleton.contains("items: list[str],"));
+        assert!(skeleton.contains("timeout: int = 30,"));
+        assert!(skeleton.contains(") -> bool:"));
+        assert!(skeleton.contains("\"\"\"Process multiple items with timeout.\"\"\""));
+        assert!(!skeleton.contains("return self._active"));
+        assert!(!skeleton.contains("print(\"Processing...\")"));
+    }
+
+    #[test]
+    fn test_typescript_method_and_arrow() {
+        let code = r#"
+class Component {
+    fetchData() {
+        return axios.get("/api");
+    }
+}
+
+const compute = (x: number) => {
+    return x * 2;
+};
+"#;
+        let skeleton = AstSkeleton::extract(code, "typescript");
+        assert!(skeleton.contains("fetchData() { /* omitted */ }"));
+        assert!(skeleton.contains("const compute = (x: number) => { /* omitted */ }"));
+        assert!(!skeleton.contains("axios.get"));
+        assert!(!skeleton.contains("return x * 2"));
+    }
+
+    #[test]
+    fn test_count_braces_with_strings_and_comments() {
+        let line = "let msg = \"{ ignored }\"; // { also ignored }";
+        let (opens, closes) = AstSkeleton::count_braces_in_line(line);
+        assert_eq!(opens, 0);
+        assert_eq!(closes, 0);
+
+        let real_line = "fn test() { if true { } }";
+        let (opens, closes) = AstSkeleton::count_braces_in_line(real_line);
+        assert_eq!(opens, 2);
+        assert_eq!(closes, 2);
+
+        let block_comment_line = "let x = 1; /* { ignored } */ let y = 2; // {";
+        let (opens, closes) = AstSkeleton::count_braces_in_line(block_comment_line);
+        assert_eq!(opens, 0);
+        assert_eq!(closes, 0);
+    }
+}
