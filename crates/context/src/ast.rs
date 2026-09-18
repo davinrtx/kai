@@ -75,7 +75,7 @@ impl AstSkeleton {
                 }
                 fn_sig_accumulator.push_str(raw_line);
 
-                if let Some(brace_pos) = fn_sig_accumulator.find('{') {
+                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_sig_accumulator) {
                     let sig_part = fn_sig_accumulator[..brace_pos].trim_end();
                     result.push(format!("{} {{ /* omitted */ }}", sig_part));
                     in_fn_signature = false;
@@ -271,6 +271,48 @@ impl AstSkeleton {
         None
     }
 
+    /// Finds the byte index of the function body `{` in a signature accumulator.
+    ///
+    /// The body `{` must occur at parenthesis depth 0 (i.e., outside the parameter list)
+    /// to avoid prematurely matching object/struct destructuring patterns inside parameters
+    /// such as `fn foo(Point { x, y }: Point)` or `function bar({ a, b }: Props)`.
+    fn find_fn_body_brace(s: &str) -> Option<usize> {
+        let mut paren_depth = 0usize;
+        let mut in_str = false;
+        let mut in_char = false;
+        let mut in_tick = false;
+        let mut prev_char = '\0';
+
+        let mut chars = s.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if !in_str
+                && !in_char
+                && !in_tick
+                && ch == '/'
+                && chars.peek().map(|&(_, c)| c) == Some('/')
+            {
+                break;
+            }
+
+            if ch == '\'' && !in_str && !in_tick && prev_char != '\\' {
+                in_char = !in_char;
+            } else if ch == '`' && !in_str && !in_char && prev_char != '\\' {
+                in_tick = !in_tick;
+            } else if ch == '"' && !in_char && !in_tick && prev_char != '\\' {
+                in_str = !in_str;
+            } else if !in_str && !in_char && !in_tick {
+                match ch {
+                    '(' => paren_depth += 1,
+                    ')' => paren_depth = paren_depth.saturating_sub(1),
+                    '{' if paren_depth == 0 => return Some(idx),
+                    _ => {}
+                }
+            }
+            prev_char = ch;
+        }
+        None
+    }
+
     /// Extracts structural outline for TypeScript / JavaScript files.
     pub fn extract_typescript(code: &str) -> String {
         let mut result = Vec::new();
@@ -302,7 +344,7 @@ impl AstSkeleton {
                 }
                 fn_accumulator.push_str(raw_line);
 
-                if let Some(brace_pos) = fn_accumulator.find('{') {
+                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_accumulator) {
                     let sig_part = fn_accumulator[..brace_pos].trim_end();
                     result.push(format!("{} {{ /* omitted */ }}", sig_part));
                     in_fn = false;
@@ -361,7 +403,7 @@ impl AstSkeleton {
                 }
                 fn_accumulator.push_str(raw_line);
 
-                if let Some(brace_pos) = fn_accumulator.find('{') {
+                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_accumulator) {
                     let sig_part = fn_accumulator[..brace_pos].trim_end();
                     result.push(format!("{} {{ /* omitted */ }}", sig_part));
                     in_fn = false;
@@ -504,17 +546,19 @@ impl AstSkeleton {
         false
     }
 
-    /// Counts open `{` and close `}` in a line while ignoring strings, line comments, and block comments.
+    /// Counts open `{` and close `}` in a line while ignoring strings, chars, line comments, and block comments.
     fn count_braces_in_line(line: &str) -> (usize, usize) {
         let mut opens = 0usize;
         let mut closes = 0usize;
         let mut in_str = false;
+        let mut in_char = false;
+        let mut in_tick = false;
         let mut in_block_comment = false;
         let mut prev_char = '\0';
 
         let mut chars = line.chars().peekable();
         while let Some(ch) = chars.next() {
-            if !in_str && !in_block_comment {
+            if !in_str && !in_char && !in_tick && !in_block_comment {
                 if ch == '/' && chars.peek() == Some(&'/') {
                     // Line comment begins, stop scanning line
                     break;
@@ -536,9 +580,13 @@ impl AstSkeleton {
                 continue;
             }
 
-            if ch == '"' && prev_char != '\\' {
+            if ch == '\'' && !in_str && !in_tick && prev_char != '\\' {
+                in_char = !in_char;
+            } else if ch == '`' && !in_str && !in_char && prev_char != '\\' {
+                in_tick = !in_tick;
+            } else if ch == '"' && !in_char && !in_tick && prev_char != '\\' {
                 in_str = !in_str;
-            } else if !in_str {
+            } else if !in_str && !in_char && !in_tick {
                 if ch == '{' {
                     opens += 1;
                 } else if ch == '}' {
@@ -690,5 +738,45 @@ const compute = (x: number) => {
         let (opens, closes) = AstSkeleton::count_braces_in_line(block_comment_line);
         assert_eq!(opens, 0);
         assert_eq!(closes, 0);
+
+        let char_literal_line = "let c = '{'; let d = '}';";
+        let (opens, closes) = AstSkeleton::count_braces_in_line(char_literal_line);
+        assert_eq!(opens, 0);
+        assert_eq!(closes, 0);
+    }
+
+    #[test]
+    fn test_destructuring_parameters_in_signatures() {
+        let ts_code = r#"
+export function renderWidget({ id, title }: { id: string; title: string }): Html {
+    return `<div>${id}: ${title}</div>`;
+}
+
+const handle = ({ x, y }: Point): number => {
+    return x + y;
+};
+"#;
+        let ts_skeleton = AstSkeleton::extract(ts_code, "typescript");
+        assert!(ts_skeleton.contains("export function renderWidget({ id, title }: { id: string; title: string }): Html { /* omitted */ }"));
+        assert!(
+            ts_skeleton.contains("const handle = ({ x, y }: Point): number => { /* omitted */ }")
+        );
+        assert!(!ts_skeleton.contains("return `<div>"));
+
+        let rs_code = r#"
+pub fn calculate(Point { x, y }: Point) -> i32 {
+    let ch = '{';
+    x + y
+}
+
+pub fn next_fn() -> bool {
+    true
+}
+"#;
+        let rs_skeleton = AstSkeleton::extract(rs_code, "rust");
+        assert!(rs_skeleton
+            .contains("pub fn calculate(Point { x, y }: Point) -> i32 { /* omitted */ }"));
+        assert!(rs_skeleton.contains("pub fn next_fn() -> bool { /* omitted */ }"));
+        assert!(!rs_skeleton.contains("let ch = '{';"));
     }
 }
