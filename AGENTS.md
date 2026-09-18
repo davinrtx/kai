@@ -116,3 +116,8 @@ crates/
 - Labels for affected crates: `pkg:core`, `pkg:context`, `pkg:tools`, `pkg:orchestrator`, `pkg:session`, `pkg:sandbox`.
 - Write issue/PR comments to a temporary file and submit via `gh issue/pr comment --body-file <tmp_file>`.
 - Changelog location: `crates/*/CHANGELOG.md` or root `CHANGELOG.md`. Unreleased entries go under `## [Unreleased]`.
+
+## 12. Releasing & Versioning
+
+- For release preparation, SemVer bumps, Git tagging, and GitHub Release publication, load and follow [.kai/skills/release.md](.kai/skills/release.md).
+- Never bump versions in feature branches; version increments are strictly isolated to dedicated release commits.
