@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-09-19
+
+### Added
+- `kai-core`: Core contract traits for resilient architectures: `CodePatcher`, `WorkspaceManager`, `WorktreeScope`, `WorkspaceProposal`, `SemanticAnalyzer`, `CommandIsolationEngine`, `GrammarLoader`.
+- `kai-core`: Forensic failure reflection schema `FailureTombstone` with high-priority negative context constraint generator (`format_as_negative_prompt`).
+- `kai-tools`: Resilient fuzzy search/replace patch engine (`FuzzyBlockPatcher`) supporting multi-tier matching (exact, whitespace-normalized, sliding-window Levenshtein similarity).
+- `kai-tools`: Integrated `ApplyPatchTool` with automatic syntax routing between `<<<<<<< SEARCH` blocks and standard unified diffs.
+- `kai-orchestrator`: Sub-agent ephemeral Git worktree isolation manager (`GitWorkspaceManager`) with isolated `git worktree add --detach` workspaces and RAII drop cleanup (`git worktree remove --force` / `prune`).
+- `kai-orchestrator`: Immutable mutation proposal generator (`WorkspaceProposal`) for sub-agent proposals reviewed by the root agent.
+- `kai-context`: Lightweight on-demand Language Server Protocol client (`LspClient`) over process stdio with standard HTTP-style `Content-Length` framing.
+- `kai-context`: Dynamic Tree-sitter grammar registry (`WasmGrammarRegistry`) abstracting AST parser loading and bytecode caching to decouple from native C host compilers.
+- `kai-session`: Session DAG Anti-Amnesia failure coordinator (`TombstoneCoordinator`) injecting diagnostic reflection nodes and negative constraints on rollback branch points.
+- `kai-session`: Preserved failure tombstones across history compaction in `AutoCompactor`.
+- `kai-sandbox`: Kernel-level container and sandbox process isolation engine (`BubblewrapIsolationEngine`) with unprivileged `bwrap` confinement, masked user credentials (`~/.ssh`, `~/.aws`), scrubbed host environment variables, and portable fallback.
+
 ## [0.6.2] - 2026-09-19
 
 ### Added
