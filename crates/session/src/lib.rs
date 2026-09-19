@@ -13,6 +13,8 @@ pub mod branch;
 pub mod compactor;
 pub mod graph;
 pub mod persistence;
+pub mod search;
+pub mod trajectory;
 
 pub use branch::{BranchManager, DEFAULT_BRANCH_NAME};
 pub use compactor::{
@@ -21,6 +23,8 @@ pub use compactor::{
 };
 pub use graph::{MemorySessionStore, SessionGraphData};
 pub use persistence::FileSessionStore;
+pub use search::{SearchResult, SessionSearchIndex};
+pub use trajectory::{TrajectoryExporter, TrajectoryFormat};
 
 #[cfg(test)]
 mod tests {

@@ -402,6 +402,171 @@ pub trait SessionStore: Send + Sync {
     fn delete_session<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<()>>;
 }
 
+/// Interceptor contract for lifecycle hooks surrounding agent reasoning steps and tool calls.
+pub trait AgentMiddleware: Send + Sync {
+    /// Human-readable identifier for this middleware layer.
+    fn name(&self) -> &str;
+
+    /// Interceptor hook invoked before an agent or language model processes conversational messages.
+    fn before_turn<'a>(
+        &'a self,
+        _messages: &'a mut Vec<Message>,
+        _context: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Interceptor hook invoked after an agent turn finishes, before outcome finalization.
+    fn after_turn<'a>(
+        &'a self,
+        _outcome: &'a mut StepOutcome,
+        _context: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Interceptor hook invoked when a tool execution produces an error.
+    ///
+    /// Returns `Some(ToolResult)` if the middleware remediates or wraps the error, or `None` to pass-through.
+    fn on_tool_error<'a>(
+        &'a self,
+        _tool_name: &'a str,
+        _error: &'a ToolError,
+        _context: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<Option<ToolResult>>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+/// Structured procedural skill or guideline dynamically loaded into agent context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillDefinition {
+    /// Unique identifier or filename slug of the skill.
+    pub name: String,
+    /// Concise description of what capability this skill provides.
+    pub description: String,
+    /// Activation triggers, task keywords, or slash-commands associated with this skill.
+    pub triggers: Vec<String>,
+    /// Procedural markdown instructions, workflows, or rules for the agent.
+    pub instructions: String,
+    /// Optional source file path where this skill was loaded from.
+    pub source_path: Option<String>,
+}
+
+impl SkillDefinition {
+    /// Constructs a new [`SkillDefinition`].
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        instructions: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            triggers: Vec::new(),
+            instructions: instructions.into(),
+            source_path: None,
+        }
+    }
+
+    /// Adds triggers to the skill definition.
+    pub fn with_triggers(mut self, triggers: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.triggers = triggers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Associates an origin file path with the skill definition.
+    pub fn with_source_path(mut self, source_path: impl Into<String>) -> Self {
+        self.source_path = Some(source_path.into());
+        self
+    }
+
+    /// Evaluates whether the skill is relevant to a query or prompt based on name, description, or triggers.
+    pub fn matches_query(&self, query: &str) -> bool {
+        let q_lower = query.to_ascii_lowercase();
+        if q_lower.contains(&self.name.to_ascii_lowercase()) {
+            return true;
+        }
+        for trigger in &self.triggers {
+            if q_lower.contains(&trigger.to_ascii_lowercase()) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Decision outcome produced by a [`ToolApprovalPolicy`] prior to tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalDecision {
+    /// Tool execution is permitted without external intervention.
+    Approved,
+    /// Tool execution requires explicit user confirmation or supervisor review.
+    RequiresConfirmation {
+        /// Rationale explaining why confirmation is required.
+        reason: String,
+    },
+    /// Tool execution is blocked by security or governance policy.
+    Denied {
+        /// Rationale explaining why execution was denied.
+        reason: String,
+    },
+}
+
+impl ApprovalDecision {
+    /// Returns true if execution is approved.
+    pub fn is_approved(&self) -> bool {
+        matches!(self, Self::Approved)
+    }
+
+    /// Returns true if execution requires confirmation.
+    pub fn requires_confirmation(&self) -> bool {
+        matches!(self, Self::RequiresConfirmation { .. })
+    }
+
+    /// Returns true if execution was denied.
+    pub fn is_denied(&self) -> bool {
+        matches!(self, Self::Denied { .. })
+    }
+}
+
+/// Policy interceptor evaluating risk and authorization before tools execute.
+pub trait ToolApprovalPolicy: Send + Sync {
+    /// Evaluates whether a tool invocation is approved, requires confirmation, or is denied.
+    fn evaluate(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        context: &ToolContext,
+    ) -> ApprovalDecision;
+}
+
+/// Permissive default approval policy allowing all tool executions.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AlwaysApprovePolicy;
+
+impl ToolApprovalPolicy for AlwaysApprovePolicy {
+    fn evaluate(
+        &self,
+        _tool_name: &str,
+        _arguments: &serde_json::Value,
+        _context: &ToolContext,
+    ) -> ApprovalDecision {
+        ApprovalDecision::Approved
+    }
+}
+
+/// Contract for multi-agent task dispatching and sub-agent supervision.
+pub trait TaskDispatcher: Send + Sync {
+    /// Dispatches a task to a designated sub-agent and awaits completion.
+    fn dispatch_task<'a>(
+        &'a self,
+        sub_agent_id: &'a str,
+        task_description: &'a str,
+        context: &'a ToolContext,
+    ) -> BoxFuture<'a, Result<String>>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1041,5 +1206,103 @@ mod tests {
         };
         assert_eq!(agent.serialize_state(), None);
         assert!(agent.restore_state(json!({"step": 1})).is_ok());
+    }
+
+    struct PassthroughMiddleware;
+    impl AgentMiddleware for PassthroughMiddleware {
+        fn name(&self) -> &str {
+            "passthrough"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_agent_middleware_default_hooks() {
+        let mw = PassthroughMiddleware;
+        assert_eq!(mw.name(), "passthrough");
+
+        let mut msgs = vec![Message::user("u1", "hello")];
+        let ctx = ToolContext::new("/test", "s1", "a1");
+        assert!(mw.before_turn(&mut msgs, &ctx).await.is_ok());
+
+        let mut outcome = StepOutcome::Completed(Message::assistant("a1", "hi"));
+        assert!(mw.after_turn(&mut outcome, &ctx).await.is_ok());
+
+        let err = ToolError::ExecutionFailed {
+            name: "tool".to_string(),
+            reason: "fail".to_string(),
+        };
+        let res = mw.on_tool_error("tool", &err, &ctx).await.unwrap();
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_skill_definition_creation_and_matching() {
+        let skill = SkillDefinition::new("cargo-audit", "Audits dependencies", "Run cargo audit")
+            .with_triggers(["audit", "security", "deps"])
+            .with_source_path(".kai/skills/cargo-audit.md");
+
+        assert_eq!(skill.name, "cargo-audit");
+        assert_eq!(
+            skill.source_path.as_deref(),
+            Some(".kai/skills/cargo-audit.md")
+        );
+        assert!(skill.matches_query("Please audit our codebase"));
+        assert!(skill.matches_query("Check security vulnerabilities"));
+        assert!(skill.matches_query("Run cargo-audit now"));
+        assert!(!skill.matches_query("Optimize database queries"));
+    }
+
+    #[test]
+    fn test_approval_decision_helpers_and_policy() {
+        let app = ApprovalDecision::Approved;
+        assert!(app.is_approved());
+        assert!(!app.requires_confirmation());
+        assert!(!app.is_denied());
+
+        let conf = ApprovalDecision::RequiresConfirmation {
+            reason: "destructive command".to_string(),
+        };
+        assert!(!conf.is_approved());
+        assert!(conf.requires_confirmation());
+        assert!(!conf.is_denied());
+
+        let den = ApprovalDecision::Denied {
+            reason: "blocked resource".to_string(),
+        };
+        assert!(!den.is_approved());
+        assert!(!den.requires_confirmation());
+        assert!(den.is_denied());
+
+        let policy = AlwaysApprovePolicy;
+        let ctx = ToolContext::new("/workspace", "s1", "a1");
+        let dec = policy.evaluate("exec_command", &json!({}), &ctx);
+        assert!(dec.is_approved());
+    }
+
+    struct MockDispatcher;
+    impl TaskDispatcher for MockDispatcher {
+        fn dispatch_task<'a>(
+            &'a self,
+            sub_agent_id: &'a str,
+            task_description: &'a str,
+            _context: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<String>> {
+            Box::pin(async move {
+                Ok(format!(
+                    "Sub-agent {sub_agent_id} completed: {task_description}"
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_task_dispatcher_contract() {
+        let dispatcher = MockDispatcher;
+        let ctx = ToolContext::new("/workspace", "s1", "a1");
+        let res = dispatcher
+            .dispatch_task("researcher", "find benchmarks", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(res, "Sub-agent researcher completed: find benchmarks");
     }
 }

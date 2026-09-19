@@ -9,16 +9,20 @@
 //! - [`DaemonSupervisor`]: Long-running background service harness with heartbeat tracking.
 
 pub mod daemon;
+pub mod delegation;
 pub mod dispatcher;
 pub mod engine;
 pub mod inbox;
+pub mod middleware;
 
 pub use daemon::{DaemonState, DaemonSupervisor};
+pub use delegation::DelegateTaskTool;
 pub use dispatcher::{
     SubAgentDispatcher, SubAgentInfo, SubAgentStatus, DEFAULT_MAX_CONCURRENT_SUBAGENTS,
 };
-pub use engine::{OrchestrationEngine, DEFAULT_MAX_TURNS};
+pub use engine::{OrchestrationEngine, DEFAULT_MAX_CORRECTION_ATTEMPTS, DEFAULT_MAX_TURNS};
 pub use inbox::{InboxReceiver, InboxSender, TaskInbox, DEFAULT_INBOX_CAPACITY};
+pub use middleware::{DiagnosticAuditMiddleware, MiddlewarePipeline};
 
 #[cfg(test)]
 mod tests {

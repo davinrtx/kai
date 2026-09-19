@@ -1,0 +1,32 @@
+[package]
+name = "kai-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "kai_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kai"
+path = "src/main.rs"
+
+[dependencies]
+kai-core.workspace = true
+kai-context.workspace = true
+kai-tools.workspace = true
+kai-orchestrator.workspace = true
+kai-session.workspace = true
+kai-sandbox.workspace = true
+
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "io-std", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+rustyline = "18.0.1"

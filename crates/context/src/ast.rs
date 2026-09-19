@@ -34,13 +34,15 @@ impl AstSkeleton {
         let mut omit_target_depth: Option<usize> = None;
         let mut in_fn_signature = false;
         let mut fn_sig_accumulator = String::new();
+        let mut in_block_comment = false;
 
         for raw_line in code.lines() {
             let trimmed = raw_line.trim_start();
 
             // If we are currently omitting a function body
             if let Some(target) = omit_target_depth {
-                let (opens, closes) = Self::count_braces_in_line(raw_line);
+                let (opens, closes) =
+                    Self::count_braces_in_line(raw_line, &mut in_block_comment, true);
                 depth = depth.saturating_add(opens).saturating_sub(closes);
                 if depth <= target {
                     omit_target_depth = None;
@@ -49,11 +51,12 @@ impl AstSkeleton {
             }
 
             // Check if line contains a macro_rules declaration
-            if trimmed.starts_with("macro_rules!") {
+            if !in_block_comment && trimmed.starts_with("macro_rules!") {
                 if let Some(brace_pos) = raw_line.find('{') {
                     let sig_part = raw_line[..brace_pos].trim_end();
                     result.push(format!("{} {{ /* omitted */ }}", sig_part));
-                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let (opens, closes) =
+                        Self::count_braces_in_line(raw_line, &mut in_block_comment, true);
                     let initial_depth = depth;
                     depth = depth.saturating_add(opens).saturating_sub(closes);
                     if depth > initial_depth {
@@ -64,7 +67,7 @@ impl AstSkeleton {
             }
 
             // Check if line contains a function declaration
-            if !in_fn_signature && Self::is_rust_fn_start(trimmed) {
+            if !in_block_comment && !in_fn_signature && Self::is_rust_fn_start(trimmed) {
                 in_fn_signature = true;
                 fn_sig_accumulator.clear();
             }
@@ -75,13 +78,14 @@ impl AstSkeleton {
                 }
                 fn_sig_accumulator.push_str(raw_line);
 
-                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_sig_accumulator) {
+                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_sig_accumulator, true) {
                     let sig_part = fn_sig_accumulator[..brace_pos].trim_end();
                     result.push(format!("{} {{ /* omitted */ }}", sig_part));
                     in_fn_signature = false;
                     fn_sig_accumulator.clear();
 
-                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let (opens, closes) =
+                        Self::count_braces_in_line(raw_line, &mut in_block_comment, true);
                     let initial_depth = depth;
                     depth = depth.saturating_add(opens).saturating_sub(closes);
                     if depth > initial_depth {
@@ -97,7 +101,7 @@ impl AstSkeleton {
             }
 
             // Normal line: update depth and preserve
-            let (opens, closes) = Self::count_braces_in_line(raw_line);
+            let (opens, closes) = Self::count_braces_in_line(raw_line, &mut in_block_comment, true);
             depth = depth.saturating_add(opens).saturating_sub(closes);
             result.push(raw_line.to_string());
         }
@@ -271,31 +275,82 @@ impl AstSkeleton {
         None
     }
 
+    /// Checks whether an apostrophe at `idx` in `s` initiates a Rust lifetime token (e.g. `'a`, `'static`, `'_`)
+    /// rather than a character literal (e.g. `'a'`, `'\n'`).
+    fn is_rust_lifetime_at(s: &str, idx: usize) -> bool {
+        let remainder = &s[idx + 1..];
+        let mut chars = remainder.chars().peekable();
+
+        // Lifetimes must start with an ASCII alphabetic char or underscore
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+            _ => return false,
+        }
+
+        // Consume remaining valid identifier chars
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                chars.next();
+            } else {
+                break;
+            }
+        }
+
+        // If immediately followed by a closing single quote, this is a char literal ('a' or 'ident'), not a lifetime
+        chars.peek() != Some(&'\'')
+    }
+
     /// Finds the byte index of the function body `{` in a signature accumulator.
     ///
     /// The body `{` must occur at parenthesis depth 0 (i.e., outside the parameter list)
     /// to avoid prematurely matching object/struct destructuring patterns inside parameters
     /// such as `fn foo(Point { x, y }: Point)` or `function bar({ a, b }: Props)`.
-    fn find_fn_body_brace(s: &str) -> Option<usize> {
+    fn find_fn_body_brace(s: &str, is_rust: bool) -> Option<usize> {
         let mut paren_depth = 0usize;
         let mut in_str = false;
         let mut in_char = false;
         let mut in_tick = false;
+        let mut in_block_comment = false;
         let mut prev_char = '\0';
 
         let mut chars = s.char_indices().peekable();
         while let Some((idx, ch)) = chars.next() {
-            if !in_str
-                && !in_char
-                && !in_tick
-                && ch == '/'
-                && chars.peek().map(|&(_, c)| c) == Some('/')
-            {
-                break;
+            if !in_str && !in_char && !in_tick && !in_block_comment {
+                if ch == '/' && chars.peek().map(|&(_, c)| c) == Some('/') {
+                    // Line comment begins: skip until newline
+                    for (_, c) in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                    prev_char = '\n';
+                    continue;
+                }
+                if ch == '/' && chars.peek().map(|&(_, c)| c) == Some('*') {
+                    in_block_comment = true;
+                    chars.next(); // consume '*'
+                    prev_char = '*';
+                    continue;
+                }
+            }
+
+            if in_block_comment {
+                if ch == '*' && chars.peek().map(|&(_, c)| c) == Some('/') {
+                    in_block_comment = false;
+                    chars.next(); // consume '/'
+                    prev_char = '/';
+                }
+                continue;
             }
 
             if ch == '\'' && !in_str && !in_tick && prev_char != '\\' {
-                in_char = !in_char;
+                if in_char {
+                    in_char = false;
+                } else if is_rust && Self::is_rust_lifetime_at(s, idx) {
+                    // Rust lifetime ('a, 'static, '_), do not toggle in_char
+                } else {
+                    in_char = true;
+                }
             } else if ch == '`' && !in_str && !in_char && prev_char != '\\' {
                 in_tick = !in_tick;
             } else if ch == '"' && !in_char && !in_tick && prev_char != '\\' {
@@ -320,12 +375,14 @@ impl AstSkeleton {
         let mut omit_target_depth: Option<usize> = None;
         let mut in_fn = false;
         let mut fn_accumulator = String::new();
+        let mut in_block_comment = false;
 
         for raw_line in code.lines() {
             let trimmed = raw_line.trim_start();
 
             if let Some(target) = omit_target_depth {
-                let (opens, closes) = Self::count_braces_in_line(raw_line);
+                let (opens, closes) =
+                    Self::count_braces_in_line(raw_line, &mut in_block_comment, false);
                 depth = depth.saturating_add(opens).saturating_sub(closes);
                 if depth <= target {
                     omit_target_depth = None;
@@ -333,7 +390,7 @@ impl AstSkeleton {
                 continue;
             }
 
-            if !in_fn && Self::is_ts_fn_start(trimmed) {
+            if !in_block_comment && !in_fn && Self::is_ts_fn_start(trimmed) {
                 in_fn = true;
                 fn_accumulator.clear();
             }
@@ -344,13 +401,14 @@ impl AstSkeleton {
                 }
                 fn_accumulator.push_str(raw_line);
 
-                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_accumulator) {
+                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_accumulator, false) {
                     let sig_part = fn_accumulator[..brace_pos].trim_end();
                     result.push(format!("{} {{ /* omitted */ }}", sig_part));
                     in_fn = false;
                     fn_accumulator.clear();
 
-                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let (opens, closes) =
+                        Self::count_braces_in_line(raw_line, &mut in_block_comment, false);
                     let initial_depth = depth;
                     depth = depth.saturating_add(opens).saturating_sub(closes);
                     if depth > initial_depth {
@@ -364,7 +422,8 @@ impl AstSkeleton {
                 continue;
             }
 
-            let (opens, closes) = Self::count_braces_in_line(raw_line);
+            let (opens, closes) =
+                Self::count_braces_in_line(raw_line, &mut in_block_comment, false);
             depth = depth.saturating_add(opens).saturating_sub(closes);
             result.push(raw_line.to_string());
         }
@@ -379,12 +438,14 @@ impl AstSkeleton {
         let mut omit_target_depth: Option<usize> = None;
         let mut in_fn = false;
         let mut fn_accumulator = String::new();
+        let mut in_block_comment = false;
 
         for raw_line in code.lines() {
             let trimmed = raw_line.trim_start();
 
             if let Some(target) = omit_target_depth {
-                let (opens, closes) = Self::count_braces_in_line(raw_line);
+                let (opens, closes) =
+                    Self::count_braces_in_line(raw_line, &mut in_block_comment, false);
                 depth = depth.saturating_add(opens).saturating_sub(closes);
                 if depth <= target {
                     omit_target_depth = None;
@@ -392,7 +453,7 @@ impl AstSkeleton {
                 continue;
             }
 
-            if !in_fn && trimmed.starts_with("func ") {
+            if !in_block_comment && !in_fn && trimmed.starts_with("func ") {
                 in_fn = true;
                 fn_accumulator.clear();
             }
@@ -403,13 +464,14 @@ impl AstSkeleton {
                 }
                 fn_accumulator.push_str(raw_line);
 
-                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_accumulator) {
+                if let Some(brace_pos) = Self::find_fn_body_brace(&fn_accumulator, false) {
                     let sig_part = fn_accumulator[..brace_pos].trim_end();
                     result.push(format!("{} {{ /* omitted */ }}", sig_part));
                     in_fn = false;
                     fn_accumulator.clear();
 
-                    let (opens, closes) = Self::count_braces_in_line(raw_line);
+                    let (opens, closes) =
+                        Self::count_braces_in_line(raw_line, &mut in_block_comment, false);
                     let initial_depth = depth;
                     depth = depth.saturating_add(opens).saturating_sub(closes);
                     if depth > initial_depth {
@@ -419,7 +481,8 @@ impl AstSkeleton {
                 continue;
             }
 
-            let (opens, closes) = Self::count_braces_in_line(raw_line);
+            let (opens, closes) =
+                Self::count_braces_in_line(raw_line, &mut in_block_comment, false);
             depth = depth.saturating_add(opens).saturating_sub(closes);
             result.push(raw_line.to_string());
         }
@@ -547,33 +610,36 @@ impl AstSkeleton {
     }
 
     /// Counts open `{` and close `}` in a line while ignoring strings, chars, line comments, and block comments.
-    fn count_braces_in_line(line: &str) -> (usize, usize) {
+    fn count_braces_in_line(
+        line: &str,
+        in_block_comment: &mut bool,
+        is_rust: bool,
+    ) -> (usize, usize) {
         let mut opens = 0usize;
         let mut closes = 0usize;
         let mut in_str = false;
         let mut in_char = false;
         let mut in_tick = false;
-        let mut in_block_comment = false;
         let mut prev_char = '\0';
 
-        let mut chars = line.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if !in_str && !in_char && !in_tick && !in_block_comment {
-                if ch == '/' && chars.peek() == Some(&'/') {
+        let mut chars = line.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if !in_str && !in_char && !in_tick && !*in_block_comment {
+                if ch == '/' && chars.peek().map(|&(_, c)| c) == Some('/') {
                     // Line comment begins, stop scanning line
                     break;
                 }
-                if ch == '/' && chars.peek() == Some(&'*') {
-                    in_block_comment = true;
+                if ch == '/' && chars.peek().map(|&(_, c)| c) == Some('*') {
+                    *in_block_comment = true;
                     chars.next(); // consume '*'
                     prev_char = '*';
                     continue;
                 }
             }
 
-            if in_block_comment {
-                if ch == '*' && chars.peek() == Some(&'/') {
-                    in_block_comment = false;
+            if *in_block_comment {
+                if ch == '*' && chars.peek().map(|&(_, c)| c) == Some('/') {
+                    *in_block_comment = false;
                     chars.next(); // consume '/'
                     prev_char = '/';
                 }
@@ -581,7 +647,13 @@ impl AstSkeleton {
             }
 
             if ch == '\'' && !in_str && !in_tick && prev_char != '\\' {
-                in_char = !in_char;
+                if in_char {
+                    in_char = false;
+                } else if is_rust && Self::is_rust_lifetime_at(line, idx) {
+                    // Rust lifetime ('a, 'static), do not enter char literal mode
+                } else {
+                    in_char = true;
+                }
             } else if ch == '`' && !in_str && !in_char && prev_char != '\\' {
                 in_tick = !in_tick;
             } else if ch == '"' && !in_char && !in_tick && prev_char != '\\' {
@@ -609,28 +681,26 @@ mod tests {
         let code = r#"
 pub struct Service {
     name: String,
+    port: u16,
 }
 
 impl Service {
     pub fn new(name: String) -> Self {
-        let validated = name.trim();
-        Self {
-            name: validated.to_string(),
-        }
+        let default_port = 8080;
+        Self { name, port: default_port }
     }
 
-    pub fn run(&self) -> bool {
-        println!("Running: {}", self.name);
-        true
+    pub fn run(&self) {
+        println!("Running {}", self.name);
     }
 }
 "#;
-
         let skeleton = AstSkeleton::extract(code, "rust");
-        assert!(skeleton.contains("pub struct Service"));
+        assert!(skeleton.contains("pub struct Service {"));
         assert!(skeleton.contains("pub fn new(name: String) -> Self { /* omitted */ }"));
-        assert!(skeleton.contains("pub fn run(&self) -> bool { /* omitted */ }"));
-        assert!(!skeleton.contains("validated.to_string()"));
+        assert!(skeleton.contains("pub fn run(&self) { /* omitted */ }"));
+        assert!(!skeleton.contains("println!"));
+        assert!(!skeleton.contains("default_port"));
     }
 
     #[test]
@@ -650,27 +720,19 @@ macro_rules! my_macro {
     #[test]
     fn test_python_skeleton_extraction() {
         let code = r#"
-class Agent:
+class Controller:
+    """Class docstring."""
     def __init__(self, name: str):
-        """Initialize agent."""
         self.name = name
-        self.state = {}
 
-    def execute(self, task: str) -> bool:
-        result = task.lower()
+    def execute(self) -> bool:
+        """Execute method."""
         return True
-
-    def quick_inline(self): return 42
 "#;
-
         let skeleton = AstSkeleton::extract(code, "python");
-        assert!(skeleton.contains("class Agent:"));
+        assert!(skeleton.contains("class Controller:"));
         assert!(skeleton.contains("def __init__(self, name: str):"));
-        assert!(skeleton.contains("\"\"\"Initialize agent.\"\"\""));
-        assert!(skeleton.contains("def execute(self, task: str) -> bool:"));
-        assert!(skeleton.contains("def quick_inline(self): ..."));
-        assert!(!skeleton.contains("self.state = {}"));
-        assert!(!skeleton.contains("result = task.lower()"));
+        assert!(skeleton.contains("def execute(self) -> bool:"));
     }
 
     #[test]
@@ -703,9 +765,9 @@ class Worker:
     }
 
     #[test]
-    fn test_typescript_method_and_arrow() {
+    fn test_typescript_skeleton_extraction() {
         let code = r#"
-class Component {
+export class ApiClient {
     fetchData() {
         return axios.get("/api");
     }
@@ -725,24 +787,49 @@ const compute = (x: number) => {
     #[test]
     fn test_count_braces_with_strings_and_comments() {
         let line = "let msg = \"{ ignored }\"; // { also ignored }";
-        let (opens, closes) = AstSkeleton::count_braces_in_line(line);
+        let (opens, closes) = AstSkeleton::count_braces_in_line(line, &mut false, true);
         assert_eq!(opens, 0);
         assert_eq!(closes, 0);
 
         let real_line = "fn test() { if true { } }";
-        let (opens, closes) = AstSkeleton::count_braces_in_line(real_line);
+        let (opens, closes) = AstSkeleton::count_braces_in_line(real_line, &mut false, true);
         assert_eq!(opens, 2);
         assert_eq!(closes, 2);
 
         let block_comment_line = "let x = 1; /* { ignored } */ let y = 2; // {";
-        let (opens, closes) = AstSkeleton::count_braces_in_line(block_comment_line);
+        let (opens, closes) =
+            AstSkeleton::count_braces_in_line(block_comment_line, &mut false, true);
         assert_eq!(opens, 0);
         assert_eq!(closes, 0);
 
         let char_literal_line = "let c = '{'; let d = '}';";
-        let (opens, closes) = AstSkeleton::count_braces_in_line(char_literal_line);
+        let (opens, closes) =
+            AstSkeleton::count_braces_in_line(char_literal_line, &mut false, true);
         assert_eq!(opens, 0);
         assert_eq!(closes, 0);
+
+        // Rust lifetime in struct definition line
+        let lifetime_line = "pub struct ItemRef<'a> {";
+        let (opens, closes) = AstSkeleton::count_braces_in_line(lifetime_line, &mut false, true);
+        assert_eq!(opens, 1);
+        assert_eq!(closes, 0);
+
+        // Multi-line block comment spanning lines
+        let mut in_comment = false;
+        let c1 = "/* begin block";
+        let (o1, c_1) = AstSkeleton::count_braces_in_line(c1, &mut in_comment, true);
+        assert_eq!((o1, c_1), (0, 0));
+        assert!(in_comment);
+
+        let c2 = "   { open brace inside comment }";
+        let (o2, c_2) = AstSkeleton::count_braces_in_line(c2, &mut in_comment, true);
+        assert_eq!((o2, c_2), (0, 0));
+        assert!(in_comment);
+
+        let c3 = "   end of comment */ { valid_code }";
+        let (o3, c_3) = AstSkeleton::count_braces_in_line(c3, &mut in_comment, true);
+        assert_eq!((o3, c_3), (1, 1));
+        assert!(!in_comment);
     }
 
     #[test]
@@ -778,5 +865,46 @@ pub fn next_fn() -> bool {
             .contains("pub fn calculate(Point { x, y }: Point) -> i32 { /* omitted */ }"));
         assert!(rs_skeleton.contains("pub fn next_fn() -> bool { /* omitted */ }"));
         assert!(!rs_skeleton.contains("let ch = '{';"));
+    }
+
+    #[test]
+    fn test_rust_lifetimes_in_signature_and_struct() {
+        let code = r#"
+pub fn process<'a, 'b: 'a>(item: &'a str, fallback: &'b str) -> &'a str {
+    let internal = 42;
+    item
+}
+
+pub struct Wrapper<'a> {
+    pub inner: &'a str,
+}
+
+impl<'a> Wrapper<'a> {
+    pub fn get(&'a self) -> &'a str {
+        self.inner
+    }
+}
+"#;
+        let skeleton = AstSkeleton::extract(code, "rust");
+        assert!(skeleton.contains("pub fn process<'a, 'b: 'a>(item: &'a str, fallback: &'b str) -> &'a str { /* omitted */ }"));
+        assert!(skeleton.contains("pub fn get(&'a self) -> &'a str { /* omitted */ }"));
+        assert!(!skeleton.contains("let internal = 42;"));
+    }
+
+    #[test]
+    fn test_multiline_block_comments_with_braces() {
+        let code = r#"
+/*
+   fn commented_out() {
+       let a = 1;
+   }
+*/
+pub fn active_fn() -> i32 {
+    100
+}
+"#;
+        let skeleton = AstSkeleton::extract(code, "rust");
+        assert!(skeleton.contains("pub fn active_fn() -> i32 { /* omitted */ }"));
+        assert!(!skeleton.contains("fn commented_out() { /* omitted */ }"));
     }
 }

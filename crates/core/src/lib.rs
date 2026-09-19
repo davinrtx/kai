@@ -5,10 +5,13 @@
 //! This crate defines Level 1 of the hexagonal architecture, providing pure traits and data types
 //! without dependencies on concrete infrastructure or downstream crates.
 
+pub mod cache;
 pub mod error;
 pub mod event;
 pub mod message;
 pub mod traits;
+
+pub use cache::ToolResultCache;
 
 pub use error::{
     ConfigError, ContextError, InferenceError, InternalError, KaiError, OrchestratorError, Result,
@@ -25,6 +28,7 @@ pub use message::{
     TRUNCATION_BYTE_NOTICE,
 };
 pub use traits::{
-    Agent, BoxFuture, ContextProcessor, PermissionCategory, SandboxPolicy, SessionNode,
-    SessionStore, StepOutcome, Tool, ToolContext,
+    Agent, AgentMiddleware, AlwaysApprovePolicy, ApprovalDecision, BoxFuture, ContextProcessor,
+    PermissionCategory, SandboxPolicy, SessionNode, SessionStore, SkillDefinition, StepOutcome,
+    TaskDispatcher, Tool, ToolApprovalPolicy, ToolContext,
 };

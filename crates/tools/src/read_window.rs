@@ -204,7 +204,11 @@ impl Tool for ReadWindowTool {
 
                 if lines_read < args.limit {
                     let display_line = if line.len() > 2048 {
-                        format!("{} [Line truncated: exceeded 2KB cap]", &line[..2048])
+                        let mut boundary = 2048;
+                        while boundary > 0 && !line.is_char_boundary(boundary) {
+                            boundary -= 1;
+                        }
+                        format!("{} [Line truncated: exceeded 2KB cap]", &line[..boundary])
                     } else {
                         line
                     };

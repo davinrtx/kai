@@ -220,7 +220,7 @@ impl ContextProcessor for DeterministicContextProcessor {
             // Protects conversational integrity: prunes entire (User + Assistant + Tool) turns
             // to ensure no orphan ToolResults and that the sequence strictly alternates validly.
             let mut pruned_turns = 0usize;
-            let estimated_notice_tokens = 12usize;
+            let estimated_notice_tokens = 24usize;
 
             loop {
                 // Find indices of all User messages
@@ -268,31 +268,28 @@ impl ContextProcessor for DeterministicContextProcessor {
                     "[Context compacted: {} earlier conversational turns omitted]",
                     pruned_turns
                 );
-                let notice_tokens = notice_text.len().div_ceil(self.chars_per_token);
 
-                if self.estimate_tokens(&working) + notice_tokens <= target_tokens {
-                    if let Some(first_msg) = working.first_mut() {
-                        if first_msg.role == Role::System {
-                            // Append to existing system message to respect single-system prompt invariant
-                            let mut appended = false;
-                            for block in &mut first_msg.content {
-                                if let ContentBlock::Text { text } = block {
-                                    text.push_str(&format!("\n\n{}", notice_text));
-                                    appended = true;
-                                    break;
-                                }
+                if let Some(first_msg) = working.first_mut() {
+                    if first_msg.role == Role::System {
+                        // Append to existing system message to respect single-system prompt invariant
+                        let mut appended = false;
+                        for block in &mut first_msg.content {
+                            if let ContentBlock::Text { text } = block {
+                                text.push_str(&format!("\n\n{}", notice_text));
+                                appended = true;
+                                break;
                             }
-                            if !appended {
-                                first_msg.content.push(ContentBlock::text(notice_text));
-                            }
-                        } else {
-                            // No system message at index 0, insert system notice at index 0
-                            let notice = Message::system(
-                                format!("compacted-notice-{}", kai_core::current_timestamp_ms()),
-                                notice_text,
-                            );
-                            working.insert(0, notice);
                         }
+                        if !appended {
+                            first_msg.content.push(ContentBlock::text(notice_text));
+                        }
+                    } else {
+                        // No system message at index 0, insert system notice at index 0
+                        let notice = Message::system(
+                            format!("compacted-notice-{}", kai_core::current_timestamp_ms()),
+                            notice_text,
+                        );
+                        working.insert(0, notice);
                     }
                 }
             }

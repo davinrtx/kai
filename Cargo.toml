@@ -7,10 +7,11 @@ members = [
     "crates/orchestrator",
     "crates/session",
     "crates/sandbox",
+    "crates/cli",
 ]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.80"
 authors = ["KAI Contributors"]
@@ -25,10 +26,13 @@ serde_json = "1.0"
 regex = "1.10"
 ignore = "0.4"
 tree-sitter = "0.22"
+clap = { version = "4.5", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 kai-core = { path = "crates/core" }
 kai-context = { path = "crates/context" }
 kai-tools = { path = "crates/tools" }
+kai-orchestrator = { path = "crates/orchestrator" }
 kai-session = { path = "crates/session" }
 kai-sandbox = { path = "crates/sandbox" }
 

@@ -6,3 +6,6 @@ Cargo.lock
 .env*
 *.pem
 *.key
+*.exe
+*.old
+.kai/sessions/
