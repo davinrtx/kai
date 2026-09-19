@@ -12,8 +12,8 @@ use kai_core::event::{global_steering_channel, Event, EventBus, SteeringState};
 use kai_core::message::{Message, ToolCall, ToolResult};
 use kai_core::traits::{Agent, BoxFuture, PermissionCategory, StepOutcome, Tool, ToolContext};
 use kai_orchestrator::{
-    DaemonState, DaemonSupervisor, OrchestrationEngine, SubAgentDispatcher, SubAgentStatus,
-    TaskInbox,
+    DaemonState, DaemonSupervisor, MiddlewarePipeline, OrchestrationEngine, SubAgentDispatcher,
+    SubAgentStatus, TaskInbox,
 };
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -629,4 +629,641 @@ async fn test_daemon_supervisor_pausing_state_reflection() {
     let join_res = handle.await.unwrap();
     assert!(join_res.is_ok());
     assert_eq!(supervisor.state().await, DaemonState::Stopped);
+}
+
+#[tokio::test]
+async fn test_orchestration_engine_middleware_and_self_correction() {
+    use kai_core::error::ToolError;
+    use kai_core::traits::{AgentMiddleware, BoxFuture};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct TestMiddleware {
+        before_called: Arc<AtomicBool>,
+        after_called: Arc<AtomicBool>,
+        error_remediated: Arc<AtomicBool>,
+    }
+
+    impl AgentMiddleware for TestMiddleware {
+        fn name(&self) -> &str {
+            "test_middleware"
+        }
+
+        fn before_turn<'a>(
+            &'a self,
+            _messages: &'a mut Vec<Message>,
+            _context: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<()>> {
+            self.before_called.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn after_turn<'a>(
+            &'a self,
+            _outcome: &'a mut StepOutcome,
+            _context: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<()>> {
+            self.after_called.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn on_tool_error<'a>(
+            &'a self,
+            tool_name: &'a str,
+            _error: &'a ToolError,
+            _context: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<Option<ToolResult>>> {
+            if tool_name == "recoverable_tool" {
+                self.error_remediated.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(Some(ToolResult::success("call_rec_1", "recovered value"))) })
+            } else {
+                Box::pin(async { Ok(None) })
+            }
+        }
+    }
+
+    let before_flag = Arc::new(AtomicBool::new(false));
+    let after_flag = Arc::new(AtomicBool::new(false));
+    let remediated_flag = Arc::new(AtomicBool::new(false));
+
+    let mw = Arc::new(TestMiddleware {
+        before_called: before_flag.clone(),
+        after_called: after_flag.clone(),
+        error_remediated: remediated_flag.clone(),
+    });
+
+    let pipeline = MiddlewarePipeline::new().with_layer(mw);
+    assert_eq!(pipeline.len(), 1);
+    assert!(!pipeline.is_empty());
+
+    struct RecoveringAgent {
+        turn: Arc<AtomicUsize>,
+    }
+
+    impl Agent for RecoveringAgent {
+        fn id(&self) -> &str {
+            "recovering_agent"
+        }
+        fn name(&self) -> &str {
+            "recovering"
+        }
+        fn step<'a>(
+            &'a mut self,
+            inbox: &'a [Message],
+        ) -> BoxFuture<'a, kai_core::error::Result<StepOutcome>> {
+            Box::pin(async move {
+                let current = self.turn.fetch_add(1, Ordering::SeqCst);
+                if current == 0 {
+                    let call = ToolCall::new("call_rec_1", "recoverable_tool", json!({}));
+                    Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                        "msg_call",
+                        vec![call],
+                    )]))
+                } else {
+                    let last = inbox.last().unwrap();
+                    let results = last.tool_result_blocks();
+                    assert_eq!(results.len(), 1);
+                    assert!(!results[0].is_error);
+                    assert_eq!(results[0].output, "recovered value");
+                    Ok(StepOutcome::Completed(Message::assistant("final", "done")))
+                }
+            })
+        }
+    }
+
+    struct FailingTool;
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            "recoverable_tool"
+        }
+        fn description(&self) -> &str {
+            "fails by default"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        fn permission_category(&self) -> PermissionCategory {
+            PermissionCategory::FileRead
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<ToolResult>> {
+            Box::pin(async move { Ok(ToolResult::error("call_rec_1", "hardware glitch")) })
+        }
+    }
+
+    let inbox = Arc::new(TaskInbox::new(16));
+    let agent = Arc::new(Mutex::new(RecoveringAgent {
+        turn: Arc::new(AtomicUsize::new(0)),
+    }));
+
+    let mut engine = OrchestrationEngine::new(agent, inbox.clone(), "/workspace", "sess_mw")
+        .with_middleware(pipeline);
+    engine.register_tool(Arc::new(FailingTool));
+
+    let final_msg = engine.run().await.unwrap();
+    assert_eq!(final_msg.text_content(), "done");
+    assert!(before_flag.load(Ordering::SeqCst));
+    assert!(after_flag.load(Ordering::SeqCst));
+    assert!(remediated_flag.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn test_orchestration_engine_inbox_preservation_on_middleware_failure() {
+    use kai_core::traits::{AgentMiddleware, BoxFuture};
+
+    struct FailingBeforeTurnMiddleware;
+    impl AgentMiddleware for FailingBeforeTurnMiddleware {
+        fn name(&self) -> &str {
+            "failing_before"
+        }
+        fn before_turn<'a>(
+            &'a self,
+            _messages: &'a mut Vec<Message>,
+            _context: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<()>> {
+            Box::pin(async {
+                Err(kai_core::error::KaiError::Internal(
+                    kai_core::error::InternalError::new("simulated middleware before_turn failure"),
+                ))
+            })
+        }
+    }
+
+    let inbox = Arc::new(TaskInbox::new(16));
+    inbox
+        .enqueue(Message::user("u1", "Message that must not be lost"))
+        .await
+        .unwrap();
+
+    let pipeline = MiddlewarePipeline::new().with_layer(Arc::new(FailingBeforeTurnMiddleware));
+
+    struct DummyAgent;
+    impl Agent for DummyAgent {
+        fn id(&self) -> &str {
+            "dummy"
+        }
+        fn name(&self) -> &str {
+            "dummy"
+        }
+        fn step<'a>(
+            &'a mut self,
+            _inbox: &'a [Message],
+        ) -> BoxFuture<'a, kai_core::error::Result<StepOutcome>> {
+            Box::pin(async { Ok(StepOutcome::Completed(Message::assistant("a", "done"))) })
+        }
+    }
+
+    let mut engine = OrchestrationEngine::new(
+        Arc::new(Mutex::new(DummyAgent)),
+        inbox.clone(),
+        "/workspace",
+        "s1",
+    )
+    .with_middleware(pipeline);
+
+    let step_res = engine.step().await;
+    assert!(step_res.is_err());
+
+    // Verify message was restored back to inbox
+    let restored = inbox.drain_all().await;
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].text_content(), "Message that must not be lost");
+}
+
+#[tokio::test]
+async fn test_orchestration_engine_bounded_self_correction_attempts() {
+    struct AlwaysFailingTool;
+    impl Tool for AlwaysFailingTool {
+        fn name(&self) -> &str {
+            "flaky_tool"
+        }
+        fn description(&self) -> &str {
+            "always fails"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        fn permission_category(&self) -> PermissionCategory {
+            PermissionCategory::FileRead
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<ToolResult>> {
+            Box::pin(async move { Ok(ToolResult::error("call_fail", "flaky network")) })
+        }
+    }
+
+    struct RetryingAgent {
+        step_count: Arc<AtomicUsize>,
+    }
+    impl Agent for RetryingAgent {
+        fn id(&self) -> &str {
+            "retry_agent"
+        }
+        fn name(&self) -> &str {
+            "retry"
+        }
+        fn step<'a>(
+            &'a mut self,
+            inbox: &'a [Message],
+        ) -> BoxFuture<'a, kai_core::error::Result<StepOutcome>> {
+            Box::pin(async move {
+                let current = self.step_count.fetch_add(1, Ordering::SeqCst);
+                if current == 0 {
+                    let call = ToolCall::new("call_fail_1", "flaky_tool", json!({}));
+                    Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                        "c1",
+                        vec![call],
+                    )]))
+                } else if current == 1 {
+                    let last = inbox.last().unwrap();
+                    let res = &last.tool_result_blocks()[0];
+                    assert!(res.output.contains("attempt 1/2"));
+                    let call = ToolCall::new("call_fail_2", "flaky_tool", json!({}));
+                    Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                        "c2",
+                        vec![call],
+                    )]))
+                } else if current == 2 {
+                    let last = inbox.last().unwrap();
+                    let res = &last.tool_result_blocks()[0];
+                    assert!(res.output.contains("attempt 2/2"));
+                    let call = ToolCall::new("call_fail_3", "flaky_tool", json!({}));
+                    Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                        "c3",
+                        vec![call],
+                    )]))
+                } else {
+                    let last = inbox.last().unwrap();
+                    let res = &last.tool_result_blocks()[0];
+                    assert!(res
+                        .output
+                        .contains("exceeded maximum self-correction attempts (3/2)"));
+                    Ok(StepOutcome::Completed(Message::assistant(
+                        "final",
+                        "gave up gracefully",
+                    )))
+                }
+            })
+        }
+    }
+
+    let inbox = Arc::new(TaskInbox::new(16));
+    let steps = Arc::new(AtomicUsize::new(0));
+    let agent = Arc::new(Mutex::new(RetryingAgent {
+        step_count: steps.clone(),
+    }));
+
+    let mut engine = OrchestrationEngine::new(agent, inbox, "/workspace", "s_bound")
+        .with_max_correction_attempts(2)
+        .with_max_turns(10);
+    engine.register_tool(Arc::new(AlwaysFailingTool));
+
+    let final_msg = engine.run().await.unwrap();
+    assert_eq!(final_msg.text_content(), "gave up gracefully");
+    assert_eq!(steps.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn test_orchestration_engine_approval_policy_suspension() {
+    use kai_core::traits::{ApprovalDecision, ToolApprovalPolicy};
+
+    struct StrictConfirmationPolicy;
+    impl ToolApprovalPolicy for StrictConfirmationPolicy {
+        fn evaluate(
+            &self,
+            tool_name: &str,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> ApprovalDecision {
+            if tool_name == "dangerous_tool" {
+                ApprovalDecision::RequiresConfirmation {
+                    reason: "Requires administrator confirmation".to_string(),
+                }
+            } else {
+                ApprovalDecision::Approved
+            }
+        }
+    }
+
+    struct CallingAgent;
+    impl Agent for CallingAgent {
+        fn id(&self) -> &str {
+            "caller"
+        }
+        fn name(&self) -> &str {
+            "caller"
+        }
+        fn step<'a>(
+            &'a mut self,
+            _inbox: &'a [Message],
+        ) -> BoxFuture<'a, kai_core::error::Result<StepOutcome>> {
+            Box::pin(async {
+                let call = ToolCall::new("c1", "dangerous_tool", json!({}));
+                Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                    "tc",
+                    vec![call],
+                )]))
+            })
+        }
+    }
+
+    struct DangerousTool;
+    impl Tool for DangerousTool {
+        fn name(&self) -> &str {
+            "dangerous_tool"
+        }
+        fn description(&self) -> &str {
+            "dangerous"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        fn permission_category(&self) -> PermissionCategory {
+            PermissionCategory::ShellExecution
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<ToolResult>> {
+            Box::pin(async { Ok(ToolResult::success("c1", "executed")) })
+        }
+    }
+
+    let inbox = Arc::new(TaskInbox::new(16));
+    let mut engine = OrchestrationEngine::new(
+        Arc::new(Mutex::new(CallingAgent)),
+        inbox,
+        "/workspace",
+        "s_policy",
+    )
+    .with_approval_policy(Arc::new(StrictConfirmationPolicy));
+    engine.register_tool(Arc::new(DangerousTool));
+
+    let outcome = engine.step().await.unwrap();
+    assert!(outcome.is_suspended());
+    if let StepOutcome::Suspended { reason } = outcome {
+        assert!(reason.contains("Requires administrator confirmation"));
+    } else {
+        panic!("expected suspended step outcome");
+    }
+}
+
+#[tokio::test]
+async fn test_orchestration_engine_approval_policy_denial() {
+    use kai_core::traits::{ApprovalDecision, ToolApprovalPolicy};
+
+    struct DenyingPolicy;
+    impl ToolApprovalPolicy for DenyingPolicy {
+        fn evaluate(
+            &self,
+            _tool_name: &str,
+            _args: &serde_json::Value,
+            _ctx: &ToolContext,
+        ) -> ApprovalDecision {
+            ApprovalDecision::Denied {
+                reason: "Operation forbidden by corporate policy".to_string(),
+            }
+        }
+    }
+
+    struct StepAgent {
+        turn: Arc<AtomicUsize>,
+    }
+    impl Agent for StepAgent {
+        fn id(&self) -> &str {
+            "step_agent"
+        }
+        fn name(&self) -> &str {
+            "step"
+        }
+        fn step<'a>(
+            &'a mut self,
+            inbox: &'a [Message],
+        ) -> BoxFuture<'a, kai_core::error::Result<StepOutcome>> {
+            Box::pin(async move {
+                let current = self.turn.fetch_add(1, Ordering::SeqCst);
+                if current == 0 {
+                    let call = ToolCall::new("c1", "forbidden_tool", json!({}));
+                    Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                        "m1",
+                        vec![call],
+                    )]))
+                } else {
+                    let last = inbox.last().unwrap();
+                    let res = &last.tool_result_blocks()[0];
+                    assert!(res.is_error);
+                    assert!(res.output.contains(
+                        "Policy denied execution of 'forbidden_tool': Operation forbidden"
+                    ));
+                    Ok(StepOutcome::Completed(Message::assistant(
+                        "m2",
+                        "acknowledged denial",
+                    )))
+                }
+            })
+        }
+    }
+
+    struct DummyTool;
+    impl Tool for DummyTool {
+        fn name(&self) -> &str {
+            "forbidden_tool"
+        }
+        fn description(&self) -> &str {
+            "forbidden"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        fn permission_category(&self) -> PermissionCategory {
+            PermissionCategory::FileWrite
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<ToolResult>> {
+            Box::pin(async { Ok(ToolResult::success("c1", "executed")) })
+        }
+    }
+
+    let inbox = Arc::new(TaskInbox::new(16));
+    let turns = Arc::new(AtomicUsize::new(0));
+    let mut engine = OrchestrationEngine::new(
+        Arc::new(Mutex::new(StepAgent {
+            turn: turns.clone(),
+        })),
+        inbox,
+        "/workspace",
+        "s_deny",
+    )
+    .with_approval_policy(Arc::new(DenyingPolicy));
+    engine.register_tool(Arc::new(DummyTool));
+
+    let final_msg = engine.run().await.unwrap();
+    assert_eq!(final_msg.text_content(), "acknowledged denial");
+    assert_eq!(turns.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn test_delegate_task_tool_dispatch_and_resolution() {
+    use kai_orchestrator::DelegateTaskTool;
+
+    let dispatcher = Arc::new(SubAgentDispatcher::new(4));
+
+    struct WorkerSubAgent;
+    impl Agent for WorkerSubAgent {
+        fn id(&self) -> &str {
+            "worker_sub"
+        }
+        fn name(&self) -> &str {
+            "worker"
+        }
+        fn step<'a>(
+            &'a mut self,
+            inbox: &'a [Message],
+        ) -> BoxFuture<'a, kai_core::error::Result<StepOutcome>> {
+            Box::pin(async move {
+                let prompt = inbox.first().map(|m| m.text_content()).unwrap_or_default();
+                let output = format!("Analyzed: {prompt}");
+                Ok(StepOutcome::Completed(Message::assistant(
+                    "sub_done", output,
+                )))
+            })
+        }
+    }
+
+    dispatcher
+        .register_agent(Arc::new(Mutex::new(WorkerSubAgent)))
+        .await
+        .unwrap();
+
+    let tool = DelegateTaskTool::new(dispatcher);
+    let ctx = ToolContext::new("/workspace", "s_del", "main_agent");
+
+    let args = json!({
+        "agent_id": "worker_sub",
+        "task": "benchmark sort algorithms"
+    });
+
+    let res = tool.execute(args, &ctx).await.unwrap();
+    assert!(!res.is_error);
+    assert!(res.output.contains("Analyzed: benchmark sort algorithms"));
+}
+
+#[tokio::test]
+async fn test_orchestration_engine_tool_result_caching() {
+    use kai_core::ToolResultCache;
+
+    struct CountingReadOnlyTool {
+        call_count: Arc<AtomicUsize>,
+    }
+    impl Tool for CountingReadOnlyTool {
+        fn name(&self) -> &str {
+            "read_counts"
+        }
+        fn description(&self) -> &str {
+            "reads counted items"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+        fn permission_category(&self) -> PermissionCategory {
+            PermissionCategory::FileRead
+        }
+        fn is_read_only(&self) -> bool {
+            true
+        }
+        fn execute<'a>(
+            &'a self,
+            _args: serde_json::Value,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, kai_core::error::Result<ToolResult>> {
+            Box::pin(async move {
+                let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(ToolResult::success(
+                    "c1",
+                    format!("Invocation count: {count}"),
+                ))
+            })
+        }
+    }
+
+    struct RepeatCallerAgent {
+        turn: Arc<AtomicUsize>,
+    }
+    impl Agent for RepeatCallerAgent {
+        fn id(&self) -> &str {
+            "repeat_caller"
+        }
+        fn name(&self) -> &str {
+            "caller"
+        }
+        fn step<'a>(
+            &'a mut self,
+            inbox: &'a [Message],
+        ) -> BoxFuture<'a, kai_core::error::Result<StepOutcome>> {
+            Box::pin(async move {
+                let current = self.turn.fetch_add(1, Ordering::SeqCst);
+                if current == 0 {
+                    let call = ToolCall::new("call_1", "read_counts", json!({ "key": "val" }));
+                    Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                        "m1",
+                        vec![call],
+                    )]))
+                } else if current == 1 {
+                    let last = inbox.last().unwrap();
+                    let res1 = &last.tool_result_blocks()[0];
+                    assert_eq!(res1.output, "Invocation count: 0");
+
+                    // Call the same read-only tool with identical arguments
+                    let call = ToolCall::new("call_2", "read_counts", json!({ "key": "val" }));
+                    Ok(StepOutcome::Continue(vec![Message::tool_calls(
+                        "m2",
+                        vec![call],
+                    )]))
+                } else {
+                    let last = inbox.last().unwrap();
+                    let res2 = &last.tool_result_blocks()[0];
+                    // Should receive cached result (count 0 instead of 1)
+                    assert_eq!(res2.output, "Invocation count: 0");
+                    assert_eq!(res2.tool_call_id, "call_2");
+                    Ok(StepOutcome::Completed(Message::assistant("final", "done")))
+                }
+            })
+        }
+    }
+
+    let inbox = Arc::new(TaskInbox::new(16));
+    let turns = Arc::new(AtomicUsize::new(0));
+    let tool_executions = Arc::new(AtomicUsize::new(0));
+
+    let cache = Arc::new(ToolResultCache::new(32));
+
+    let mut engine = OrchestrationEngine::new(
+        Arc::new(Mutex::new(RepeatCallerAgent {
+            turn: turns.clone(),
+        })),
+        inbox,
+        "/workspace",
+        "s_cache",
+    )
+    .with_tool_cache(cache.clone());
+
+    engine.register_tool(Arc::new(CountingReadOnlyTool {
+        call_count: tool_executions.clone(),
+    }));
+
+    let final_msg = engine.run().await.unwrap();
+    assert_eq!(final_msg.text_content(), "done");
+    assert_eq!(turns.load(Ordering::SeqCst), 3);
+    // Tool must only have been physically executed once because second call hit the cache!
+    assert_eq!(tool_executions.load(Ordering::SeqCst), 1);
+    assert_eq!(cache.len(), 1);
 }

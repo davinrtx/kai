@@ -229,3 +229,37 @@ impl SubAgentDispatcher {
         }
     }
 }
+
+impl kai_core::traits::TaskDispatcher for SubAgentDispatcher {
+    fn dispatch_task<'a>(
+        &'a self,
+        sub_agent_id: &'a str,
+        task_description: &'a str,
+        _context: &'a kai_core::traits::ToolContext,
+    ) -> kai_core::traits::BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let user_msg = Message::user(
+                format!("task_{}", kai_core::current_timestamp_ms()),
+                task_description,
+            );
+            let outcome = self.dispatch(sub_agent_id, vec![user_msg]).await?;
+            match outcome {
+                StepOutcome::Completed(final_msg) => Ok(final_msg.text_content()),
+                StepOutcome::Continue(msgs) => {
+                    let text = msgs
+                        .into_iter()
+                        .map(|m| m.text_content())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    Ok(text)
+                }
+                StepOutcome::Suspended { reason } => {
+                    Err(KaiError::Orchestrator(OrchestratorError::SubAgentFailed {
+                        agent_id: sub_agent_id.to_string(),
+                        reason: format!("Sub-agent suspended execution: {reason}"),
+                    }))
+                }
+            }
+        })
+    }
+}
