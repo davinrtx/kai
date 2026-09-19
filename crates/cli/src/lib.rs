@@ -15,7 +15,7 @@ pub mod ui;
 
 pub use agent::LlmAgent;
 pub use args::{CliArgs, Commands, RunCommand};
-pub use client::{ChatResponse, HttpTransport, LlmTransport, ModelClient};
+pub use client::{ChatResponse, HttpTransport, LlmTransport, ModelClient, TokenUsage};
 pub use config::KaiConfig;
 pub use error::{CliError, Result};
 pub use ui::CliApprovalPolicy;

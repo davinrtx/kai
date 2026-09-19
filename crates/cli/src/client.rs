@@ -12,6 +12,17 @@ use serde_json::{json, Value};
 
 use crate::error::{CliError, Result};
 
+/// Token consumption metrics reported by the inference provider.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Number of tokens in the prompt.
+    pub prompt_tokens: usize,
+    /// Number of tokens generated in the completion.
+    pub completion_tokens: usize,
+    /// Total token count.
+    pub total_tokens: usize,
+}
+
 /// Structured response received from a chat completions endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatResponse {
@@ -21,6 +32,8 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Reason reported for completion termination (`stop`, `tool_calls`, `length`).
     pub finish_reason: Option<String>,
+    /// Token consumption metrics, if provided by the inference endpoint.
+    pub usage: Option<TokenUsage>,
 }
 
 /// Abstract transport contract for dispatching inference HTTP requests.
@@ -140,6 +153,26 @@ impl ModelClient {
             api_key,
             transport,
         }
+    }
+
+    /// Returns the target inference endpoint base URL.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Returns the active inference model identifier.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Returns the configured authorization API key, if present.
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    /// Returns a reference to the active transport driver.
+    pub fn transport(&self) -> &Arc<dyn LlmTransport> {
+        &self.transport
     }
 
     /// Translates conversational messages into standard OpenAI chat completion JSON.
@@ -330,10 +363,30 @@ impl ModelClient {
             }
         }
 
+        let usage = response.get("usage").map(|u| {
+            let prompt_tokens =
+                u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let completion_tokens = u
+                .get("completion_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let total_tokens = u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            TokenUsage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: if total_tokens > 0 {
+                    total_tokens
+                } else {
+                    prompt_tokens + completion_tokens
+                },
+            }
+        });
+
         Ok(ChatResponse {
             text,
             tool_calls,
             finish_reason,
+            usage,
         })
     }
 }

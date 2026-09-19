@@ -6,6 +6,7 @@
 //! ANSI codes to prevent escape sequence artifacts (`←[1m`).
 
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kai_core::traits::{ApprovalDecision, ToolApprovalPolicy, ToolContext};
@@ -156,6 +157,131 @@ pub fn print_banner(version: &str, model: &str, base_url: &str) {
 
     println!("{b}{c}=== KAI (Krill Agent Interface) v{version} ==={r}");
     println!("{d}Endpoint: {base_url} | Model: {model}{r}\n");
+}
+
+/// Detects the currently checked-out Git branch from the repository containing `dir`.
+///
+/// Uses standard file inspection on `.git/HEAD` without spawning external processes
+/// or depending on heavy external C-FFI git libraries.
+pub fn detect_git_branch(dir: &Path) -> Option<String> {
+    let mut current = dir.to_path_buf();
+    for _ in 0..10 {
+        let git_path = current.join(".git");
+        if git_path.is_dir() {
+            let head_path = git_path.join("HEAD");
+            if let Ok(content) = std::fs::read_to_string(&head_path) {
+                let trimmed = content.trim();
+                if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+                    return Some(branch.to_string());
+                } else if trimmed.len() >= 7 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                    return Some(trimmed[..7].to_string());
+                }
+            }
+            return None;
+        } else if git_path.is_file() {
+            // Git worktree or submodule: "gitdir: <path>"
+            if let Ok(content) = std::fs::read_to_string(&git_path) {
+                let trimmed = content.trim();
+                if let Some(gitdir_rel) = trimmed.strip_prefix("gitdir:") {
+                    let gitdir = current.join(gitdir_rel.trim());
+                    let head_path = gitdir.join("HEAD");
+                    if let Ok(head_content) = std::fs::read_to_string(&head_path) {
+                        let trimmed_head = head_content.trim();
+                        if let Some(branch) = trimmed_head.strip_prefix("ref: refs/heads/") {
+                            return Some(branch.to_string());
+                        } else if trimmed_head.len() >= 7
+                            && trimmed_head.chars().all(|c| c.is_ascii_hexdigit())
+                        {
+                            return Some(trimmed_head[..7].to_string());
+                        }
+                    }
+                }
+            }
+            return None;
+        }
+
+        if !current.pop() {
+            break;
+        }
+    }
+    None
+}
+
+/// Separates `<think>...</think>` internal reasoning blocks from the assistant's final text.
+///
+/// Returns `(reasoning_thought, final_response)`.
+pub fn parse_reasoning_blocks(text: &str) -> (Option<String>, String) {
+    const START_TAG: &str = "<think>";
+    const END_TAG: &str = "</think>";
+
+    if !text.contains(START_TAG) {
+        return (None, text.to_string());
+    }
+
+    let mut thoughts = Vec::new();
+    let mut response_clean = String::new();
+    let mut cursor = 0;
+
+    while let Some(start_idx) = text[cursor..].find(START_TAG) {
+        let actual_start = cursor + start_idx;
+        // Append text preceding the start tag
+        response_clean.push_str(&text[cursor..actual_start]);
+
+        let after_start = actual_start + START_TAG.len();
+        if let Some(end_idx) = text[after_start..].find(END_TAG) {
+            let actual_end = after_start + end_idx;
+            let thought_segment = text[after_start..actual_end].trim();
+            if !thought_segment.is_empty() {
+                thoughts.push(thought_segment);
+            }
+            cursor = actual_end + END_TAG.len();
+        } else {
+            // Unclosed <think> tag: everything remaining is reasoning
+            let thought_segment = text[after_start..].trim();
+            if !thought_segment.is_empty() {
+                thoughts.push(thought_segment);
+            }
+            cursor = text.len();
+            break;
+        }
+    }
+
+    if cursor < text.len() {
+        response_clean.push_str(&text[cursor..]);
+    }
+
+    let thought_opt = if thoughts.is_empty() {
+        None
+    } else {
+        Some(thoughts.join("\n\n"))
+    };
+
+    (thought_opt, response_clean.trim().to_string())
+}
+
+/// Renders the turn-based status bar reporting active runtime metadata.
+pub fn print_status_bar(
+    model: &str,
+    tokens: usize,
+    git_branch: Option<&str>,
+    session_branch: &str,
+) {
+    let b = bold();
+    let d = dim();
+    let c = cyan();
+    let g = green();
+    let y = yellow();
+    let m = magenta();
+    let r = reset();
+
+    let git_display = git_branch.unwrap_or("none");
+    let token_str = if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        format!("{tokens}")
+    };
+
+    println!("{d}[{r}{b}Model:{r} {c}{model}{r} {d}|{r} {b}Tokens:{r} {y}{token_str}{r} {d}|{r} {b}Git:{r} {g}{git_display}{r} {d}|{r} {b}Branch:{r} {m}{session_branch}{r}{d}]{r}");
 }
 
 /// Formats and prints an agent's reasoning trace or thought.
