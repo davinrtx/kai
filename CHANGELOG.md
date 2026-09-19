@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-19
+
 ### Added
 - `kai-cli`: Interactive conversational REPL loop (`kai chat`) with rustyline line editor and persistent command history (`.kai/history`).
 - `kai-cli`: Dynamic tab autocompletion and dimmed inline hints for slash commands, arguments, file paths (`@path`), and models (`KaiHelper`).

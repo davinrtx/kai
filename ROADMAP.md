@@ -108,4 +108,23 @@ Enforce security policies, boundary confinement, and credential defense.
 * **Acceptance Criteria:**
   * Path confinement blocks `../` traversal attempts across all tools.
   * Sensitive files (.env, .pem, private keys, credentials) are blocked at the sandbox perimeter.
-  * Full workspace satisfies Definition of Done: zero clippy warnings, clean formatting, all tests passing.
+  * Full workspace satisfies Definition of Done: zero clippy warnings, clean formatting, all tests passing.
+
+---
+
+## v0.6.2 - Autonomous Agent CLI & Interactive REPL (Phase 7: `crates/cli`)
+
+Deliver autonomous conversational engineering REPL, multi-protocol local inference discovery, and terminal UX.
+
+* **Target Crate:** `kai-cli`
+* **Status:** Completed
+* **Deliverables:**
+  * Multi-turn interactive REPL loop (`kai chat`) with persistent history and tab autocompletion.
+  * Multi-protocol model discovery (`GET /api/tags`, `GET /api/v1/models`, OpenAI dual-path) with resilient TTL and negative failure caching.
+  * Context file reference injection (`@path`, `@file:<path>`) bounded to 4 KB.
+  * In-band session DAG branching, resuming, and turn compaction (`/compress`).
+  * Pure-ANSI box panel layout, live telemetry status bar, and cross-platform Windows release binary.
+* **Acceptance Criteria:**
+  * Zero local compilation dependencies; automated builds strictly verified offline.
+  * 100% panic-free production code with zero unwrap or expect calls.
+  * Complete workspace passes Definition of Done with 199/199 passing tests.
