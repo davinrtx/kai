@@ -97,12 +97,8 @@ impl PathResolver {
         }
 
         // 4. Common credentials and token storage files
-        if file_name == "credentials"
-            || file_name == "credentials.json"
-            || file_name == "secrets.json"
-            || file_name == "secrets.yaml"
-            || file_name == "secrets.yml"
-            || file_name == "secrets.toml"
+        if file_name.contains("credential")
+            || file_name.contains("secret")
             || file_name == "shadow"
             || file_name == "master.passwd"
             || file_name == ".netrc"
@@ -138,6 +134,22 @@ impl PathResolver {
             return Err(SandboxError::PathTraversalDetected {
                 path: "<null byte in path>".to_string(),
             });
+        }
+
+        // Normalize cross-platform backslashes to forward slashes to prevent separator evasion
+        let normalized = path_str.replace('\\', "/");
+        let path = Path::new(&normalized);
+
+        // Reject multi-dot evasion patterns (e.g. "..." or "....")
+        for comp in path.components() {
+            if let Component::Normal(os_str) = comp {
+                let s = os_str.to_string_lossy();
+                if s.len() > 2 && s.chars().all(|c| c == '.') {
+                    return Err(SandboxError::PathTraversalDetected {
+                        path: path.display().to_string(),
+                    });
+                }
+            }
         }
 
         // 1. Anchor relative paths to the workspace root
