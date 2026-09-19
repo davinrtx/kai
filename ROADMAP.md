@@ -45,7 +45,7 @@ Implement token reduction engines relying strictly on native C/Rust parsing rout
 Build the execution tooling layer adhering to operational bounds.
 
 * **Target Crate:** `kai-tools`
-* **Status:** Planned
+* **Status:** Completed
 * **Deliverables:**
   * `read_window`: Bounded line reader with strict `offset`/`limit` caps (150-line limit).
   * `apply_patch`: Transactional unified diff patcher with automatic rollback on failure.
@@ -59,30 +59,12 @@ Build the execution tooling layer adhering to operational bounds.
 
 ---
 
-## v0.4.0 - Branchable Session Graph (Phase 4: `crates/session`)
-
-Implement branchable conversational memory and automated context management.
-
-* **Target Crate:** `kai-session`
-* **Status:** Planned
-* **Deliverables:**
-  * Directed Acyclic Graph (DAG) session tree supporting checkpoints and parallel branches.
-  * State serializer and disk persistence engine.
-  * Out-of-band threshold auto-compactor (>80% context window threshold).
-  * Git commit synchronization for graph nodes.
-* **Acceptance Criteria:**
-  * Ability to fork and switch branches without data loss.
-  * Compaction condenses older node sequences into structured summary entries.
-  * Unit tests validating DAG integrity, cycle prevention, and branch rewinds.
-
----
-
-## v0.5.0 - Multi-Agent Orchestration (Phase 5: `crates/orchestrator`)
+## v0.4.0 - Multi-Agent Orchestration (Phase 4: `crates/orchestrator`)
 
 Implement concurrent task dispatching, ephemeral sub-agents, and background services.
 
 * **Target Crate:** `kai-orchestrator`
-* **Status:** Planned
+* **Status:** Completed
 * **Deliverables:**
   * Concurrent Task Inbox built on `tokio::sync::mpsc`.
   * Ephemeral sub-agent manager with isolated, zero-state context lifecycles.
@@ -95,17 +77,35 @@ Implement concurrent task dispatching, ephemeral sub-agents, and background serv
 
 ---
 
-## v0.6.0-beta - Production Sandbox & CLI Entrypoint (Phase 6: `crates/sandbox` & CLI)
+## v0.5.0 - Branchable Session Graph (Phase 5: `crates/session`)
 
-Enforce security policies and deliver the developer-facing command line interface MVP.
+Implement branchable conversational memory and automated context management.
 
-* **Target Crates:** `kai-sandbox`, `kai-cli`
-* **Status:** Planned
+* **Target Crate:** `kai-session`
+* **Status:** Completed
+* **Deliverables:**
+  * Directed Acyclic Graph (DAG) session tree supporting checkpoints and parallel branches.
+  * State serializer and disk persistence engine.
+  * Out-of-band threshold auto-compactor (>80% context window threshold).
+  * Git commit synchronization for graph nodes.
+* **Acceptance Criteria:**
+  * Ability to fork and switch branches without data loss.
+  * Compaction condenses older node sequences into structured summary entries.
+  * Unit tests validating DAG integrity, cycle prevention, and branch rewinds.
+
+---
+
+## v0.6.0 - Production Sandbox & Security Matrix (Phase 6: `crates/sandbox`)
+
+Enforce security policies, boundary confinement, and credential defense.
+
+* **Target Crate:** `kai-sandbox`
+* **Status:** Completed
 * **Deliverables:**
   * Canonical path resolver preventing directory traversal beyond project roots.
-  * Granular permission matrix (`AlwaysAllow`, `PromptUser`, `Deny`).
-  * Terminal User Interface (TUI) and headless CLI binary.
+  * Granular permission matrix (`standard`, `strict`, `read_only`, `permissive`).
+  * Destructive shell command detection and sensitive environment variable scrubbing.
 * **Acceptance Criteria:**
   * Path confinement blocks `../` traversal attempts across all tools.
-  * CLI boots cleanly, executes non-interactively when flagged, and satisfies baseline RAM targets.
-  * Full workspace satisfies Definition of Done: zero clippy warnings, clean formatting, all tests passing.
+  * Sensitive files (.env, .pem, private keys, credentials) are blocked at the sandbox perimeter.
+  * Full workspace satisfies Definition of Done: zero clippy warnings, clean formatting, all tests passing.
