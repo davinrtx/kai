@@ -407,7 +407,7 @@ async fn test_mcp_client_tool_discovery_and_call() {
 #[test]
 fn test_default_tools_enumeration() {
     let registry = default_tools();
-    assert_eq!(registry.len(), 5);
+    assert_eq!(registry.len(), 6);
 }
 
 #[tokio::test]
@@ -630,4 +630,117 @@ async fn test_read_window_multibyte_truncation() {
     assert!(res.output.contains("[Line truncated: exceeded 2KB cap]"));
 
     let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_skill_registry_and_learn_tool() {
+    use kai_tools::{LearnSkillTool, SkillRegistry};
+
+    let temp_dir = std::env::temp_dir().join(format!("kai_test_skills_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let tool = LearnSkillTool::new();
+    let ctx = ToolContext::new(&temp_dir, "sess_skill", "agent_skill");
+
+    let args = json!({
+        "name": "cargo-check-all",
+        "description": "Verifies compile cleanliness across workspace",
+        "triggers": ["check", "compile", "cargo check"],
+        "instructions": "# Verification\nRun cargo check --workspace"
+    });
+
+    let res = tool.execute(args, &ctx).await.unwrap();
+    assert!(!res.is_error);
+    assert!(res
+        .output
+        .contains("successfully synthesized and persisted"));
+
+    // Verify registry can discover and parse the file from directory
+    let mut registry = SkillRegistry::new();
+    let skills_dir = temp_dir.join(".kai").join("skills");
+    let loaded = registry.load_directory(&skills_dir).unwrap();
+    assert_eq!(loaded, 1);
+    assert_eq!(registry.len(), 1);
+
+    let skill = registry.get("cargo-check-all").unwrap();
+    assert_eq!(
+        skill.description,
+        "Verifies compile cleanliness across workspace"
+    );
+    assert!(skill.matches_query("Please check our code"));
+
+    let prompt = registry
+        .format_prompt_block("check the repository")
+        .unwrap();
+    assert!(prompt.contains("## Relevant Procedural Skills"));
+    assert!(prompt.contains("cargo-check-all"));
+    assert!(prompt.contains("cargo check --workspace"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_skill_registry_truncation_cap_and_slug_validation() {
+    use kai_core::traits::SkillDefinition;
+    use kai_tools::{LearnSkillTool, SkillRegistry};
+
+    let temp_dir =
+        std::env::temp_dir().join(format!("kai_test_skills_slug_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let tool = LearnSkillTool::new();
+    let ctx = ToolContext::new(&temp_dir, "sess_slug", "agent_slug");
+
+    // 1. Invalid names (empty, whitespace, or purely symbols) must fail
+    let bad_args_empty = json!({
+        "name": "   ",
+        "description": "empty slug",
+        "instructions": "fail"
+    });
+    let res = tool.execute(bad_args_empty, &ctx).await.unwrap();
+    assert!(res.is_error);
+    assert!(res.output.contains("Missing or invalid argument 'name'"));
+
+    let bad_args_symbols = json!({
+        "name": "/../...",
+        "description": "symbols only",
+        "instructions": "fail"
+    });
+    let res = tool.execute(bad_args_symbols, &ctx).await.unwrap();
+    assert!(res.is_error);
+
+    // 2. Truncation cap enforcement in format_prompt_block (cap at 5 skills)
+    let mut registry = SkillRegistry::new();
+    for i in 0..10 {
+        let skill = SkillDefinition::new(
+            format!("skill-{i}"),
+            format!("Description for skill {i}"),
+            format!("Instructions {i}"),
+        )
+        .with_triggers(["test-trigger"]);
+        registry.register(skill);
+    }
+
+    let block = registry.format_prompt_block("test-trigger").unwrap();
+    assert!(block.contains("## Relevant Procedural Skills"));
+    assert!(block.contains("skill-0"));
+    assert!(block.contains("skill-4"));
+    // Must be capped at 5 with truncation notice
+    assert!(block.contains("[Truncated: 5 remaining items. Refine query]"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_skill_registry_yaml_crlf_and_comments() {
+    use kai_tools::SkillRegistry;
+
+    let content = "---\r\n# Comment header\r\nname: \"git-squash\"\r\ndescription: \"Squashes feature commits\" # inline comment\r\ntriggers:\r\n  # trigger list comment\r\n  - \"squash\" # inline\r\n  - \"rebase\"\r\n---\r\n\r\n# Workflow\r\nExecute git rebase -i HEAD~N\r\n";
+
+    let skill = SkillRegistry::parse_skill_markdown(content, "fallback");
+    assert_eq!(skill.name, "git-squash");
+    assert_eq!(skill.description, "Squashes feature commits");
+    assert_eq!(skill.triggers, vec!["squash", "rebase"]);
+    assert!(skill.instructions.contains("Execute git rebase -i HEAD~N"));
+    assert!(skill.matches_query("Please squash these commits"));
 }

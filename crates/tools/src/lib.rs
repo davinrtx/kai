@@ -16,15 +16,18 @@ use std::sync::Arc;
 
 pub mod apply_patch;
 pub mod browser;
+pub mod cache;
 pub mod exec_command;
 pub mod mcp;
 pub mod read_window;
+pub mod skill;
 
 pub use apply_patch::{ApplyPatchArgs, ApplyPatchTool, DiffHunk};
 pub use browser::{
     BrowserActionArgs, BrowserActionOutcome, BrowserActionTool, BrowserDriver, BrowserPageInfo,
     MockBrowserDriver,
 };
+pub use cache::ToolResultCache;
 pub use exec_command::{
     ExecCommandArgs, ExecCommandTool, ProcessGuard, DEFAULT_COMMAND_TIMEOUT_MS,
     MAX_COMMAND_TIMEOUT_MS, MIN_COMMAND_TIMEOUT_MS,
@@ -34,6 +37,7 @@ pub use mcp::{
     McpTransport, MockMcpTransport,
 };
 pub use read_window::{ReadWindowArgs, ReadWindowTool, DEFAULT_WINDOW_LIMIT, MAX_WINDOW_LIMIT};
+pub use skill::{LearnSkillTool, SkillRegistry};
 
 /// Returns a default registry of core KAI tools configured for local execution.
 pub fn default_tools() -> Vec<Arc<dyn kai_core::Tool>> {
@@ -43,6 +47,7 @@ pub fn default_tools() -> Vec<Arc<dyn kai_core::Tool>> {
         Arc::new(ExecCommandTool::new()),
         Arc::new(BrowserActionTool::new()),
         Arc::new(McpClientTool::new()),
+        Arc::new(LearnSkillTool::new()),
     ]
 }
 
@@ -55,7 +60,7 @@ mod tests {
     #[test]
     fn test_default_tools_registry() {
         let tools = default_tools();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"read_window"));
@@ -63,6 +68,7 @@ mod tests {
         assert!(names.contains(&"exec_command"));
         assert!(names.contains(&"browser_action"));
         assert!(names.contains(&"mcp_client"));
+        assert!(names.contains(&"learn_skill"));
     }
 
     #[test]
