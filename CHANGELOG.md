@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `kai-cli`: Interactive conversational REPL loop (`kai chat`) with rustyline line editor and persistent command history (`.kai/history`).
+- `kai-cli`: Dynamic tab autocompletion and dimmed inline hints for slash commands, arguments, file paths (`@path`), and models (`KaiHelper`).
+- `kai-cli`: Multi-protocol local inference model discovery (`discovery.rs`) supporting native Ollama (`/api/tags`), LM Studio (`/api/v1/models` with embedding model filtering), and OpenAI dual-path fallback.
+- `kai-cli`: Resilient in-memory TTL caching (300s) and negative failure backoff caching (30s) preventing REPL stalls on unreachable endpoints.
+- `kai-cli`: Interactive model picker (`/model`) with numbered selection list, numeric switching (`/model 1`), and endpoint probing (`/model probe [url]`).
+- `kai-cli`: Context file reference expansion (`@path` / `@file:<path>`) bounded to 4 KB per file with strict truncation markers.
+- `kai-cli`: Session DAG history compactor (`/compress` / `/compact`) condensing past turns to reduce token consumption.
+- `kai-cli`: Pure-ANSI visual presentation with virtual terminal processing, precision column width alignment (`visible_width`), and unconfigured model banners.
+- `kai-cli`: Standalone Windows 64-bit release binary cross-compiled via `x86_64-pc-windows-gnu`.
+
 ## [0.6.1] - 2026-09-18
 
 ### Added
