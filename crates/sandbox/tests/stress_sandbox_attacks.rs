@@ -113,10 +113,22 @@ fn test_command_sanitizer_chained_and_adversarial_commands() {
         "dd if=/dev/urandom of=/dev/sda bs=4M",
         "dd if=/dev/zero of=/dev/nvme0n1",
         "sudo rm file.txt",
+        "echo hello && sudo rm file.txt",
+        "cat file | passwd",
         "su -",
         "passwd root",
         "apt-get install curl", // missing -y
         "apt install wget",     // missing -y
+        "rm  -rf  /",           // excessive whitespace bypass attempt
+        "rm -r -f /",           // split flag bypass attempt
+        "rm -f -r /*",          // split flag target root
+        "rm -R ~",              // capital -R flag
+        "del /s /q c:\\",       // Windows recursive wipe
+        "del   /s   /q   c:\\", // Windows spaced wipe
+        "rd /s /q c:\\",        // Windows directory wipe
+        "rmdir /s /q c:\\",     // Windows rmdir wipe
+        "format c:",            // Windows format drive
+        "format d: /fs:ntfs",   // Windows format drive
     ];
 
     for cmd in dangerous_attempts {

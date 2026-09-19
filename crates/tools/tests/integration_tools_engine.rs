@@ -603,3 +603,31 @@ async fn test_mcp_client_deterministic_sorting_and_validation() {
     assert!(bad_call.is_error);
     assert!(bad_call.output.contains("tool_name is required"));
 }
+
+#[tokio::test]
+async fn test_read_window_multibyte_truncation() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kai_test_read_window_utf8_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let file_path = temp_dir.join("multibyte.txt");
+    // Generate a line exceeding 2048 bytes with 4-byte UTF-8 char overlapping the boundary
+    let mut long_line = "A".repeat(2047);
+    long_line.push('🦀');
+    long_line.push_str(" extra trailing content");
+    fs::write(&file_path, &long_line).unwrap();
+
+    let tool = ReadWindowTool::new();
+    let ctx = ToolContext::new(&temp_dir, "sess_rw_utf8", "agent_rw");
+
+    let args = json!({
+        "path": "multibyte.txt",
+        "offset": 1,
+        "limit": 10
+    });
+    let res = tool.execute(args, &ctx).await.unwrap();
+    assert!(!res.is_error);
+    assert!(res.output.contains("[Line truncated: exceeded 2KB cap]"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
