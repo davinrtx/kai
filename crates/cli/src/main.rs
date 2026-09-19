@@ -7,6 +7,8 @@ use kai_cli::{commands, ui};
 
 #[tokio::main]
 async fn main() {
+    ui::init_terminal();
+
     let args = CliArgs::parse();
 
     let config = match KaiConfig::resolve(

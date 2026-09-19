@@ -28,8 +28,11 @@ pub fn execute(cmd: ToolsCommand) -> Result<()> {
     }
 
     println!(
-        "\x1b[1m\x1b[36mKAI Registered Tools ({} available):\x1b[0m\n",
-        tools.len()
+        "{}{}KAI Registered Tools ({} available):{}\n",
+        crate::ui::bold(),
+        crate::ui::cyan(),
+        tools.len(),
+        crate::ui::reset()
     );
     println!(
         "{:<18} {:<18} {:<12} DESCRIPTION",

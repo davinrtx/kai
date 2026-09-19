@@ -2,37 +2,179 @@
 //!
 //! Provides zero-bloat visual presentation for agent thoughts, tool invocations,
 //! diffs, and confirmation prompts without heavyweight terminal TUI dependencies.
+//! Automatically enables Windows Virtual Terminal Processing or gracefully disables
+//! ANSI codes to prevent escape sequence artifacts (`←[1m`).
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kai_core::traits::{ApprovalDecision, ToolApprovalPolicy, ToolContext};
 use serde_json::Value;
 
-// ANSI escape sequences
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const CYAN: &str = "\x1b[36m";
-const RED: &str = "\x1b[31m";
-const MAGENTA: &str = "\x1b[35m";
+static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Initializes console subsystem and enables Virtual Terminal Processing if supported.
+pub fn init_terminal() {
+    if std::env::var_os("NO_COLOR").is_some() {
+        COLOR_ENABLED.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    #[cfg(windows)]
+    {
+        type HANDLE = *mut std::ffi::c_void;
+        type BOOL = i32;
+        type DWORD = u32;
+
+        const STD_OUTPUT_HANDLE: DWORD = -11i32 as DWORD;
+        const STD_ERROR_HANDLE: DWORD = -12i32 as DWORD;
+        const ENABLE_VIRTUAL_TERMINAL_PROCESSING: DWORD = 0x0004;
+
+        extern "system" {
+            fn GetStdHandle(nStdHandle: DWORD) -> HANDLE;
+            fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut DWORD) -> BOOL;
+            fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) -> BOOL;
+        }
+
+        // Safety Invariant:
+        // C-FFI call to standard Win32 console functions with stack pointers.
+        // Verifies handle is non-null and not INVALID_HANDLE_VALUE (-1).
+        let mut any_success = false;
+        for handle_id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            let handle = unsafe { GetStdHandle(handle_id) };
+            if !handle.is_null() && handle != (-1isize as HANDLE) {
+                let mut mode: DWORD = 0;
+                let ok = unsafe {
+                    if GetConsoleMode(handle, &mut mode) != 0 {
+                        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+                    } else {
+                        false
+                    }
+                };
+                if ok {
+                    any_success = true;
+                }
+            }
+        }
+        COLOR_ENABLED.store(any_success, Ordering::SeqCst);
+    }
+
+    #[cfg(not(windows))]
+    {
+        let term = std::env::var("TERM").unwrap_or_default();
+        let supported = term != "dumb";
+        COLOR_ENABLED.store(supported, Ordering::SeqCst);
+    }
+}
+
+/// Returns the ANSI reset code if colors are enabled, or empty string.
+#[inline]
+pub fn reset() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[0m"
+    } else {
+        ""
+    }
+}
+
+/// Returns the ANSI bold code if colors are enabled, or empty string.
+#[inline]
+pub fn bold() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[1m"
+    } else {
+        ""
+    }
+}
+
+/// Returns the ANSI dim code if colors are enabled, or empty string.
+#[inline]
+pub fn dim() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[2m"
+    } else {
+        ""
+    }
+}
+
+/// Returns the ANSI green code if colors are enabled, or empty string.
+#[inline]
+pub fn green() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[32m"
+    } else {
+        ""
+    }
+}
+
+/// Returns the ANSI yellow code if colors are enabled, or empty string.
+#[inline]
+pub fn yellow() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[33m"
+    } else {
+        ""
+    }
+}
+
+/// Returns the ANSI cyan code if colors are enabled, or empty string.
+#[inline]
+pub fn cyan() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[36m"
+    } else {
+        ""
+    }
+}
+
+/// Returns the ANSI red code if colors are enabled, or empty string.
+#[inline]
+pub fn red() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[31m"
+    } else {
+        ""
+    }
+}
+
+/// Returns the ANSI magenta code if colors are enabled, or empty string.
+#[inline]
+pub fn magenta() -> &'static str {
+    if COLOR_ENABLED.load(Ordering::Relaxed) {
+        "\x1b[35m"
+    } else {
+        ""
+    }
+}
 
 /// Prints the KAI CLI ASCII banner and runtime metadata.
 pub fn print_banner(version: &str, model: &str, base_url: &str) {
-    println!("{BOLD}{CYAN}=== KAI (Krill Agent Interface) v{version} ==={RESET}");
-    println!("{DIM}Endpoint: {base_url} | Model: {model}{RESET}\n");
+    let b = bold();
+    let c = cyan();
+    let d = dim();
+    let r = reset();
+
+    println!("{b}{c}=== KAI (Krill Agent Interface) v{version} ==={r}");
+    println!("{d}Endpoint: {base_url} | Model: {model}{r}\n");
 }
 
 /// Formats and prints an agent's reasoning trace or thought.
 pub fn print_thought(text: &str) {
+    let c = cyan();
+    let d = dim();
+    let r = reset();
     if !text.trim().is_empty() {
-        println!("{CYAN}{DIM}> {text}{RESET}");
+        println!("{c}{d}> {text}{r}");
     }
 }
 
 /// Formats and prints a tool invocation notification.
 pub fn print_tool_invocation(name: &str, args: &Value) {
+    let b = bold();
+    let y = yellow();
+    let d = dim();
+    let r = reset();
+
     let args_summary = if let Value::Object(map) = args {
         let pairs: Vec<String> = map
             .iter()
@@ -52,39 +194,51 @@ pub fn print_tool_invocation(name: &str, args: &Value) {
         String::new()
     };
 
-    println!("{BOLD}{YELLOW}[Tool Call]{RESET} {BOLD}{name}{RESET} {DIM}({args_summary}){RESET}");
+    println!("{b}{y}[Tool Call]{r} {b}{name}{r} {d}({args_summary}){r}");
 }
 
 /// Formats and prints a tool execution result.
 pub fn print_tool_result(name: &str, is_error: bool, output: &str) {
+    let b = bold();
+    let g = green();
+    let rd = red();
+    let d = dim();
+    let r = reset();
+
     if is_error {
-        println!("{BOLD}{RED}[Tool Error: {name}]{RESET}\n{RED}{output}{RESET}");
+        println!("{b}{rd}[Tool Error: {name}]{r}\n{rd}{output}{r}");
     } else {
         let first_lines: Vec<&str> = output.lines().take(3).collect();
         let summary = first_lines.join("\n");
-        println!("{BOLD}{GREEN}[Tool Result: {name}]{RESET}\n{DIM}{summary}{RESET}");
+        println!("{b}{g}[Tool Result: {name}]{r}\n{d}{summary}{r}");
         if output.lines().count() > 3 {
-            println!(
-                "{DIM}... ({} lines omitted){RESET}",
-                output.lines().count() - 3
-            );
+            println!("{d}... ({} lines omitted){r}", output.lines().count() - 3);
         }
     }
 }
 
 /// Formats and prints the final assistant message.
 pub fn print_assistant_response(text: &str) {
-    println!("\n{BOLD}{MAGENTA}kai>{RESET} {text}\n");
+    let b = bold();
+    let m = magenta();
+    let r = reset();
+    println!("\n{b}{m}kai>{r} {text}\n");
 }
 
 /// Formats and prints an error message.
 pub fn print_error(msg: &str) {
-    eprintln!("{BOLD}{RED}Error:{RESET} {msg}");
+    let b = bold();
+    let rd = red();
+    let r = reset();
+    eprintln!("{b}{rd}Error:{r} {msg}");
 }
 
 /// Formats and prints an informational notice.
 pub fn print_info(msg: &str) {
-    println!("{BOLD}{CYAN}Info:{RESET} {msg}");
+    let b = bold();
+    let c = cyan();
+    let r = reset();
+    println!("{b}{c}Info:{r} {msg}");
 }
 
 /// Interactive CLI approval policy for evaluating tool execution authorization.
@@ -147,7 +301,10 @@ impl ToolApprovalPolicy for CliApprovalPolicy {
 
 /// Prompts the user on STDIN to confirm a suspended tool call.
 pub fn prompt_user_confirmation(reason: &str) -> bool {
-    print!("{BOLD}{YELLOW}[Confirmation Required]{RESET} {reason}\nProceed? [y/N]: ");
+    let b = bold();
+    let y = yellow();
+    let r = reset();
+    print!("{b}{y}[Confirmation Required]{r} {reason}\nProceed? [y/N]: ");
     let _ = io::stdout().flush();
 
     let mut input = String::new();

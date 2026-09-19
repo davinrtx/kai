@@ -84,7 +84,7 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
     });
 
     loop {
-        print!("\x1b[1m\x1b[32muser>\x1b[0m ");
+        print!("{}{}user>{} ", ui::bold(), ui::green(), ui::reset());
         let _ = io::stdout().flush();
 
         let mut line = String::new();
