@@ -9,13 +9,17 @@ pub mod agent;
 pub mod args;
 pub mod client;
 pub mod commands;
+pub mod completion;
 pub mod config;
+pub mod discovery;
 pub mod error;
 pub mod ui;
 
 pub use agent::LlmAgent;
 pub use args::{CliArgs, Commands, RunCommand};
 pub use client::{ChatResponse, HttpTransport, LlmTransport, ModelClient, TokenUsage};
+pub use completion::KaiHelper;
 pub use config::KaiConfig;
+pub use discovery::DiscoveredModel;
 pub use error::{CliError, Result};
 pub use ui::CliApprovalPolicy;

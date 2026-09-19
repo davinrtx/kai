@@ -29,3 +29,4 @@ thiserror.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 reqwest.workspace = true
+rustyline = "18.0.1"

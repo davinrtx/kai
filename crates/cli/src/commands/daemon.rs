@@ -19,7 +19,27 @@ use crate::ui;
 /// Executes the long-running daemon supervisor.
 pub async fn execute(_cmd: DaemonCommand, config: KaiConfig) -> Result<()> {
     let working_dir = config.canonical_working_dir()?;
-    ui::print_banner(env!("CARGO_PKG_VERSION"), &config.model, &config.base_url);
+    let tools = default_tools();
+    let tool_names: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+    let skills_dir = working_dir.join(".kai").join("skills");
+    let skills_count = std::fs::read_dir(&skills_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+                .count()
+        })
+        .unwrap_or(0);
+
+    ui::print_banner(
+        env!("CARGO_PKG_VERSION"),
+        &config.model,
+        &config.base_url,
+        &working_dir,
+        "session-daemon-01",
+        &tool_names,
+        skills_count,
+    );
     ui::print_info(&format!(
         "Starting KAI background daemon supervisor in {}",
         working_dir.display()
@@ -32,7 +52,6 @@ pub async fn execute(_cmd: DaemonCommand, config: KaiConfig) -> Result<()> {
         config.api_key.clone(),
     ));
 
-    let tools = default_tools();
     let tool_schemas: Vec<serde_json::Value> = tools.iter().map(|t| t.schema()).collect();
 
     let agent = Arc::new(Mutex::new(

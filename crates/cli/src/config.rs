@@ -9,7 +9,10 @@ use std::path::PathBuf;
 /// Default local OpenAI-compatible inference endpoint (Ollama standard).
 pub const DEFAULT_BASE_URL: &str = "http://localhost:11434/v1";
 
-/// Default code generation model.
+/// Marker string designating that no inference model has been configured.
+pub const UNCONFIGURED_MODEL: &str = "unconfigured";
+
+/// Default code generation model fallback when requested.
 pub const DEFAULT_MODEL: &str = "qwen2.5-coder:7b";
 
 /// Default maximum consecutive reasoning turns.
@@ -46,13 +49,17 @@ impl KaiConfig {
     ) -> Result<Self, crate::error::CliError> {
         let base_url = base_url_override
             .or_else(|| env::var("KAI_BASE_URL").ok())
+            .or_else(|| env::var("OPENAI_BASE_URL").ok())
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
 
         let model = model_override
             .or_else(|| env::var("KAI_MODEL").ok())
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+            .or_else(|| env::var("OPENAI_MODEL").ok())
+            .unwrap_or_else(|| UNCONFIGURED_MODEL.to_string());
 
-        let api_key = api_key_override.or_else(|| env::var("KAI_API_KEY").ok());
+        let api_key = api_key_override
+            .or_else(|| env::var("KAI_API_KEY").ok())
+            .or_else(|| env::var("OPENAI_API_KEY").ok());
 
         let working_dir = match working_dir_override {
             Some(dir) => dir,

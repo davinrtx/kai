@@ -7,4 +7,5 @@ Cargo.lock
 *.pem
 *.key
 *.exe
+*.old
 .kai/sessions/

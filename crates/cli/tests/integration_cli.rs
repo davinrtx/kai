@@ -431,3 +431,238 @@ async fn test_session_branching_and_resume() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_ui_box_panel_rendering() {
+    kai_cli::ui::set_color_enabled(false);
+    let lines = vec!["Hello world".to_string(), "Second line".to_string()];
+    let panel = kai_cli::ui::draw_box_panel("KAI Test", &lines, 40, "", "");
+    assert!(panel.contains("KAI Test"));
+    assert!(panel.contains("Hello world"));
+    assert!(panel.contains('╭'));
+    assert!(panel.contains('╰'));
+}
+
+#[test]
+fn test_ui_wrap_text() {
+    let text = "This is a long sentence that should wrap gracefully across multiple lines.";
+    let wrapped = kai_cli::ui::wrap_text(text, 20);
+    assert!(wrapped.len() >= 3);
+    for line in wrapped {
+        assert!(line.len() <= 20);
+    }
+}
+
+#[test]
+fn test_unconfigured_model_default() {
+    let cfg = KaiConfig::resolve(None, None, None, Some(PathBuf::from(".")), None, true).unwrap();
+    assert_eq!(cfg.model, kai_cli::config::UNCONFIGURED_MODEL);
+}
+
+#[test]
+fn test_context_reference_expansion() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "kai_ctx_test_{}",
+        kai_core::message::current_timestamp_ms()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let small_file = temp_dir.join("small.txt");
+    std::fs::write(&small_file, "Hello from small context file").unwrap();
+
+    let (expanded, attachments) = kai_cli::commands::chat::expand_context_references(
+        "Please examine @small.txt and report back",
+        &temp_dir,
+    );
+
+    assert_eq!(attachments.len(), 1);
+    assert!(attachments[0].starts_with("@small.txt"));
+    assert!(expanded.contains("Hello from small context file"));
+    assert!(expanded.contains("--- Context File: small.txt ---"));
+
+    // Large file exceeding 4 KB cap
+    let large_file = temp_dir.join("large.txt");
+    let large_content = "x".repeat(5000);
+    std::fs::write(&large_file, large_content).unwrap();
+
+    let (expanded_large, attachments_large) =
+        kai_cli::commands::chat::expand_context_references("Check @large.txt", &temp_dir);
+    assert_eq!(attachments_large.len(), 1);
+    assert!(expanded_large.contains("[Truncated: remaining bytes omitted. Refine query]"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_visible_width_calculation() {
+    assert_eq!(kai_cli::ui::visible_width("plain text"), 10);
+    assert_eq!(
+        kai_cli::ui::visible_width("\x1b[1m\x1b[31mbold red\x1b[0m"),
+        8
+    );
+}
+
+#[test]
+fn test_strip_endpoint_suffixes() {
+    use kai_cli::discovery::strip_endpoint_suffixes;
+
+    assert_eq!(
+        strip_endpoint_suffixes("http://localhost:11434/v1"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        strip_endpoint_suffixes("http://localhost:11434/api/tags"),
+        "http://localhost:11434"
+    );
+    assert_eq!(
+        strip_endpoint_suffixes("http://localhost:1234/api/v1/models/"),
+        "http://localhost:1234"
+    );
+    assert_eq!(
+        strip_endpoint_suffixes("https://api.openai.com/v1/chat/completions"),
+        "https://api.openai.com"
+    );
+}
+
+#[test]
+fn test_ollama_tags_json_parsing() {
+    use kai_cli::discovery::parse_ollama_tags_json;
+
+    let payload = json!({
+        "models": [
+            {
+                "name": "qwen2.5-coder:7b",
+                "model": "qwen2.5-coder:7b",
+                "modified_at": "2024-11-20T10:00:00Z",
+                "size": 4683072512u64,
+                "details": {
+                    "family": "qwen2",
+                    "parameter_size": "7.6B",
+                    "quantization_level": "Q4_K_M"
+                }
+            },
+            {
+                "name": "llama3.1:8b",
+                "model": "llama3.1:8b",
+                "details": {
+                    "family": "llama",
+                    "parameter_size": "8.0B"
+                }
+            }
+        ]
+    });
+
+    let models = parse_ollama_tags_json(&payload, "http://localhost:11434");
+    assert_eq!(models.len(), 2);
+
+    assert_eq!(models[0].id, "qwen2.5-coder:7b");
+    assert_eq!(models[0].provider, "ollama");
+    assert_eq!(models[0].endpoint, "http://localhost:11434/v1");
+    assert_eq!(
+        models[0].description.as_deref(),
+        Some("7.6B, Q4_K_M, qwen2")
+    );
+
+    assert_eq!(models[1].id, "llama3.1:8b");
+    assert_eq!(models[1].provider, "ollama");
+    assert_eq!(models[1].endpoint, "http://localhost:11434/v1");
+    assert_eq!(models[1].description.as_deref(), Some("8.0B, llama"));
+}
+
+#[test]
+fn test_lmstudio_models_json_parsing_and_filter() {
+    use kai_cli::discovery::parse_lmstudio_models_json;
+
+    let payload = json!({
+        "data": [
+            {
+                "id": "deepseek-coder-6.7b-instruct",
+                "object": "model",
+                "type": "llm"
+            },
+            {
+                "id": "bge-large-en-v1.5",
+                "object": "model",
+                "type": "embeddings"
+            },
+            {
+                "id": "qwen2.5-coder-7b",
+                "object": "model"
+            }
+        ]
+    });
+
+    let models = parse_lmstudio_models_json(&payload, "http://localhost:1234");
+    assert_eq!(models.len(), 2); // bge embeddings model must be filtered out!
+
+    assert_eq!(models[0].id, "deepseek-coder-6.7b-instruct");
+    assert_eq!(models[0].provider, "lmstudio");
+    assert_eq!(models[0].endpoint, "http://localhost:1234/v1");
+
+    assert_eq!(models[1].id, "qwen2.5-coder-7b");
+    assert_eq!(models[1].provider, "lmstudio");
+    assert_eq!(models[1].endpoint, "http://localhost:1234/v1");
+}
+
+#[test]
+fn test_openai_models_json_parsing() {
+    use kai_cli::discovery::parse_openai_models_json;
+
+    let payload = json!({
+        "data": [
+            {
+                "id": "gpt-4o",
+                "owned_by": "openai"
+            },
+            {
+                "id": "text-embedding-3-small",
+                "owned_by": "openai"
+            },
+            {
+                "id": "claude-3-5-sonnet",
+                "owned_by": "anthropic"
+            }
+        ]
+    });
+
+    let models = parse_openai_models_json(&payload, "https://api.openai.com/v1", "openai");
+    assert_eq!(models.len(), 2); // text-embedding must be filtered out by heuristic
+
+    assert_eq!(models[0].id, "gpt-4o");
+    assert_eq!(models[0].description.as_deref(), Some("openai"));
+    assert_eq!(models[1].id, "claude-3-5-sonnet");
+}
+
+#[tokio::test]
+async fn test_discovery_cache_positive_and_negative() {
+    use kai_cli::discovery::{DiscoveredModel, DiscoveryCache};
+
+    let cache = DiscoveryCache::new();
+    let url = "http://localhost:11434";
+
+    assert!(!cache.is_negatively_cached(url).await);
+    assert!(cache.get(url).await.is_none());
+
+    // Insert positive model
+    let model = DiscoveredModel {
+        id: "test-model".to_string(),
+        provider: "test".to_string(),
+        endpoint: format!("{url}/v1"),
+        description: None,
+    };
+    cache.insert(url, vec![model.clone()]).await;
+
+    let cached = cache.get(url).await;
+    assert!(cached.is_some());
+    assert_eq!(cached.unwrap(), vec![model]);
+
+    // Negative failure caching
+    let dead_url = "http://localhost:9999";
+    cache.mark_failure(dead_url).await;
+    assert!(cache.is_negatively_cached(dead_url).await);
+
+    // Clear cache
+    cache.clear().await;
+    assert!(!cache.is_negatively_cached(dead_url).await);
+    assert!(cache.get(url).await.is_none());
+}
