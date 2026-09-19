@@ -478,3 +478,157 @@ async fn test_graph_stale_children_cleanup_on_parent_change() {
     assert_eq!(p2_children.len(), 1);
     assert_eq!(p2_children[0].id, "child");
 }
+
+#[tokio::test]
+async fn test_trajectory_exporter_jsonl_and_sharegpt() {
+    use kai_session::TrajectoryExporter;
+
+    let exporter = TrajectoryExporter::new();
+
+    let root = SessionNode::root("n1", Message::system("m1", "You are an assistant"), 1000);
+    let user_turn = SessionNode::with_parent("n2", "n1", Message::user("m2", "Deploy code"), 2000);
+    let assist_turn =
+        SessionNode::with_parent("n3", "n2", Message::assistant("m3", "Deploying now"), 3000);
+
+    let history = vec![root, user_turn, assist_turn];
+
+    // 1. JSONL Export
+    let jsonl = exporter.export_jsonl(&history).unwrap();
+    let lines: Vec<&str> = jsonl.lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert!(lines[0].contains("\"role\":\"system\""));
+    assert!(lines[1].contains("\"role\":\"user\""));
+    assert!(lines[2].contains("\"role\":\"assistant\""));
+
+    // 2. ShareGPT Export
+    let sharegpt = exporter.export_sharegpt(&history).unwrap();
+    let convos = sharegpt["conversations"].as_array().unwrap();
+    assert_eq!(convos.len(), 3);
+    assert_eq!(convos[0]["from"], "system");
+    assert_eq!(convos[1]["from"], "human");
+    assert_eq!(convos[2]["from"], "gpt");
+    assert_eq!(convos[1]["value"], "Deploy code");
+}
+
+#[tokio::test]
+async fn test_session_search_bm25_index() {
+    use kai_session::SessionSearchIndex;
+
+    let mut index = SessionSearchIndex::new();
+
+    let n1 = SessionNode::root(
+        "node_1",
+        Message::user("m1", "Optimize Rust memory allocations and compile times"),
+        1000,
+    );
+    let n2 = SessionNode::root(
+        "node_2",
+        Message::user("m2", "Configure Docker containers and kubernetes ingress"),
+        2000,
+    );
+    let n3 = SessionNode::root(
+        "node_3",
+        Message::user("m3", "Debug database connection pool timeout in postgresql"),
+        3000,
+    );
+    let n4 = SessionNode::root(
+        "node_4",
+        Message::user("m4", "Rust compiler error with lifetime parameter 'a"),
+        4000,
+    );
+
+    index.index_history(&[n1, n2, n3, n4]);
+
+    // Search for 'rust' and 'compile'
+    let results = index.search("rust compile", 10);
+    assert!(!results.is_empty());
+    assert_eq!(results[0].node_id, "node_1");
+    assert!(results[0].snippet.contains("Rust"));
+    assert!(results[0].matched_terms.contains(&"rust".to_string()));
+
+    // Search for 'database'
+    let db_results = index.search("database postgresql", 5);
+    assert_eq!(db_results.len(), 1);
+    assert_eq!(db_results[0].node_id, "node_3");
+
+    // Search non-existent term
+    let empty_results = index.search("nonexistentwordxyz", 5);
+    assert!(empty_results.is_empty());
+}
+
+#[tokio::test]
+async fn test_session_search_idempotency_and_linear_indexing() {
+    use kai_session::SessionSearchIndex;
+
+    let mut index = SessionSearchIndex::new();
+
+    let node = SessionNode::root(
+        "unique_node",
+        Message::user("u1", "Rust memory safety guarantees"),
+        1000,
+    );
+
+    // Index once
+    index.index_node(&node);
+    let res1 = index.search("safety", 5);
+    assert_eq!(res1.len(), 1);
+    let score1 = res1[0].score;
+
+    // Index twice (same node) - must be idempotent
+    index.index_node(&node);
+    let res2 = index.search("safety", 5);
+    assert_eq!(res2.len(), 1);
+    assert!((res2[0].score - score1).abs() < f64::EPSILON);
+
+    // Re-index with updated text
+    let updated_node = SessionNode::root(
+        "unique_node",
+        Message::user("u1", "Go garbage collector concurrency"),
+        2000,
+    );
+    index.index_node(&updated_node);
+    assert!(index.search("safety", 5).is_empty());
+    let go_res = index.search("concurrency", 5);
+    assert_eq!(go_res.len(), 1);
+    assert_eq!(go_res[0].node_id, "unique_node");
+
+    // Remove node
+    index.remove_node("unique_node");
+    assert!(index.search("concurrency", 5).is_empty());
+}
+
+#[tokio::test]
+async fn test_trajectory_exporter_structured_tool_calls() {
+    use kai_core::message::{ToolCall, ToolResult};
+    use kai_session::TrajectoryExporter;
+    use serde_json::json;
+
+    let exporter = TrajectoryExporter::new();
+
+    let call = ToolCall::new(
+        "call_01",
+        "read_window",
+        json!({ "offset": 1, "limit": 10 }),
+    );
+    let msg_call = Message::tool_calls("msg_assistant_1", vec![call]);
+
+    let res = ToolResult::success("call_01", "fn main() {}");
+    let msg_res = Message::tool_results("msg_tool_1", vec![res]);
+
+    let n1 = SessionNode::root("n1", msg_call, 1000);
+    let n2 = SessionNode::with_parent("n2", "n1", msg_res, 2000);
+
+    let sharegpt = exporter.export_sharegpt(&[n1, n2]).unwrap();
+    let convos = sharegpt["conversations"].as_array().unwrap();
+    assert_eq!(convos.len(), 2);
+
+    assert_eq!(convos[0]["from"], "gpt");
+    let val_call = convos[0]["value"].as_str().unwrap();
+    assert!(val_call.contains("<tool_call>"));
+    assert!(val_call.contains("\"name\":\"read_window\""));
+    assert!(val_call.contains("\"limit\":10"));
+
+    assert_eq!(convos[1]["from"], "tool");
+    let val_res = convos[1]["value"].as_str().unwrap();
+    assert!(val_res.contains("<tool_response id=\"call_01\">fn main() {}</tool_response>"));
+}
