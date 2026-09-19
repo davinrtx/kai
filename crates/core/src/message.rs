@@ -565,6 +565,66 @@ impl Message {
     }
 }
 
+/// Forensic diagnostic reflection recorded when a session DAG branch fails and rolls back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureTombstone {
+    /// Branch name or identifier where the failure occurred.
+    pub failed_branch: String,
+    /// Identifier of the specific node that triggered the failure.
+    pub failed_node_id: String,
+    /// Trigger action or tool invocation that caused the failure.
+    pub trigger_action: String,
+    /// Raw diagnostic error trace or compiler assertion.
+    pub error_signature: String,
+    /// Structured technical root-cause synthesis.
+    pub root_cause_analysis: String,
+    /// Negative constraints that subsequent turns and alternative branches must avoid.
+    pub negative_constraints: Vec<String>,
+}
+
+impl FailureTombstone {
+    /// Constructs a new [`FailureTombstone`].
+    pub fn new(
+        failed_branch: impl Into<String>,
+        failed_node_id: impl Into<String>,
+        trigger_action: impl Into<String>,
+        error_signature: impl Into<String>,
+        root_cause_analysis: impl Into<String>,
+    ) -> Self {
+        Self {
+            failed_branch: failed_branch.into(),
+            failed_node_id: failed_node_id.into(),
+            trigger_action: trigger_action.into(),
+            error_signature: error_signature.into(),
+            root_cause_analysis: root_cause_analysis.into(),
+            negative_constraints: Vec::new(),
+        }
+    }
+
+    /// Attaches negative constraints to this tombstone.
+    pub fn with_negative_constraints(mut self, constraints: Vec<String>) -> Self {
+        self.negative_constraints = constraints;
+        self
+    }
+
+    /// Formats the tombstone into a high-priority negative context prompt block.
+    pub fn format_as_negative_prompt(&self) -> String {
+        let mut out = format!(
+            "--- NEGATIVE CONSTRAINT: PREVIOUS BRANCH FAILURE ('{}') ---\n\
+            Trigger: {}\n\
+            Signature: {}\n\
+            Root Cause: {}\n\
+            Forbidden Approaches:\n",
+            self.failed_branch, self.trigger_action, self.error_signature, self.root_cause_analysis
+        );
+        for constraint in &self.negative_constraints {
+            out.push_str(&format!("  - {constraint}\n"));
+        }
+        out.push_str("--- END CONSTRAINT ---");
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

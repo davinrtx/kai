@@ -19,6 +19,7 @@ pub mod browser;
 pub mod cache;
 pub mod exec_command;
 pub mod mcp;
+pub mod patcher;
 pub mod read_window;
 pub mod skill;
 
@@ -36,6 +37,7 @@ pub use mcp::{
     McpCallResult, McpClient, McpClientArgs, McpClientTool, McpContent, McpToolDefinition,
     McpTransport, MockMcpTransport,
 };
+pub use patcher::{FuzzyBlockPatcher, DEFAULT_SIMILARITY_THRESHOLD};
 pub use read_window::{ReadWindowArgs, ReadWindowTool, DEFAULT_WINDOW_LIMIT, MAX_WINDOW_LIMIT};
 pub use skill::{LearnSkillTool, SkillRegistry};
 

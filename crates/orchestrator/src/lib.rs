@@ -14,6 +14,7 @@ pub mod dispatcher;
 pub mod engine;
 pub mod inbox;
 pub mod middleware;
+pub mod worktree;
 
 pub use daemon::{DaemonState, DaemonSupervisor};
 pub use delegation::DelegateTaskTool;
@@ -23,6 +24,9 @@ pub use dispatcher::{
 pub use engine::{OrchestrationEngine, DEFAULT_MAX_CORRECTION_ATTEMPTS, DEFAULT_MAX_TURNS};
 pub use inbox::{InboxReceiver, InboxSender, TaskInbox, DEFAULT_INBOX_CAPACITY};
 pub use middleware::{DiagnosticAuditMiddleware, MiddlewarePipeline};
+pub use worktree::{
+    EphemeralWorktreeHandle, GitWorkspaceManager, MockWorkspaceManager, MockWorktreeScope,
+};
 
 #[cfg(test)]
 mod tests {

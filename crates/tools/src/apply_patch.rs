@@ -260,7 +260,7 @@ impl Tool for ApplyPatchTool {
     }
 
     fn description(&self) -> &str {
-        "Applies a unified diff patch to a file with transactional atomic replacement and automatic failure rollback."
+        "Applies a SEARCH/REPLACE block patch or unified diff patch to a file with transactional atomic replacement and automatic failure rollback."
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -274,7 +274,7 @@ impl Tool for ApplyPatchTool {
                 },
                 "patch": {
                     "type": "string",
-                    "description": "Unified diff patch content"
+                    "description": "SEARCH/REPLACE blocks (<<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE) or unified diff patch content"
                 }
             }
         })
@@ -362,24 +362,64 @@ impl Tool for ApplyPatchTool {
                 String::new()
             };
 
-            let hunks = match Self::parse_unified_diff(&args.patch) {
-                Ok(h) => h,
-                Err(err) => {
+            let (patched_content, summary) = if args.patch.contains("<<<<<<<") {
+                let blocks = crate::patcher::FuzzyBlockPatcher::parse_blocks(&args.patch);
+                if blocks.is_empty() {
                     return Ok(ToolResult::error(
                         self.name(),
-                        format!("Diff parse error: {err}"),
+                        "No valid SEARCH/REPLACE blocks found in patch",
                     ));
                 }
-            };
+                let patcher = crate::patcher::FuzzyBlockPatcher::default();
+                let patch_res = match kai_core::traits::CodePatcher::apply_blocks(
+                    &patcher,
+                    &target_path,
+                    &original_content,
+                    &blocks,
+                ) {
+                    Ok(res) => res,
+                    Err(err) => {
+                        return Ok(ToolResult::error(
+                            self.name(),
+                            format!("Fuzzy patch application failed: {err}"),
+                        ));
+                    }
+                };
+                let summary_msg = format!(
+                    "Successfully applied {} block(s) (confidence {:.2}) to '{}' ({} bytes)",
+                    patch_res.applied_count,
+                    patch_res.confidence_score,
+                    target_path.display(),
+                    patch_res.modified_content.len()
+                );
+                (patch_res.modified_content, summary_msg)
+            } else {
+                let hunks = match Self::parse_unified_diff(&args.patch) {
+                    Ok(h) => h,
+                    Err(err) => {
+                        return Ok(ToolResult::error(
+                            self.name(),
+                            format!("Diff parse error: {err}"),
+                        ));
+                    }
+                };
 
-            let patched_content = match Self::apply_hunks(&original_content, &hunks) {
-                Ok(c) => c,
-                Err(err) => {
-                    return Ok(ToolResult::error(
-                        self.name(),
-                        format!("Patch application failed: {err}"),
-                    ));
-                }
+                let res_content = match Self::apply_hunks(&original_content, &hunks) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        return Ok(ToolResult::error(
+                            self.name(),
+                            format!("Patch application failed: {err}"),
+                        ));
+                    }
+                };
+                let summary_msg = format!(
+                    "Successfully applied {} hunk(s) to '{}' ({} bytes)",
+                    hunks.len(),
+                    target_path.display(),
+                    res_content.len()
+                );
+                (res_content, summary_msg)
             };
 
             // Transactional atomic write: write to sibling temp file, then atomic rename
@@ -424,14 +464,53 @@ impl Tool for ApplyPatchTool {
                 }));
             }
 
-            let summary = format!(
-                "Successfully applied {} hunk(s) to '{}' ({} bytes)",
-                hunks.len(),
-                target_path.display(),
-                patched_content.len()
-            );
-
             Ok(ToolResult::success(self.name(), summary))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kai_core::traits::ToolContext;
+
+    #[tokio::test]
+    async fn test_apply_patch_tool_search_replace_block() {
+        let unique_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kai_test_patch_{}_{}",
+            std::process::id(),
+            unique_id
+        ));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let file_path = dir.join("code.rs");
+        tokio::fs::write(&file_path, "fn hello() {\n    println!(\"old\");\n}\n")
+            .await
+            .expect("write");
+
+        let tool = ApplyPatchTool::new();
+        let ctx = ToolContext::new(dir.to_path_buf(), "test-session", "test-agent");
+        let patch_text = r#"
+<<<<<<< SEARCH
+    println!("old");
+=======
+    println!("new");
+>>>>>>> REPLACE
+"#;
+        let args = json!({
+            "path": "code.rs",
+            "patch": patch_text,
+        });
+
+        let res = tool.execute(args, &ctx).await.expect("execute");
+        assert!(!res.is_error);
+
+        let modified = tokio::fs::read_to_string(&file_path).await.expect("read");
+        assert!(modified.contains("println!(\"new\");"));
+        assert!(!modified.contains("println!(\"old\");"));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

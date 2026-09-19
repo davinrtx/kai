@@ -24,11 +24,16 @@ pub use event::{
 };
 pub use message::{
     current_timestamp_ms, truncate_items, truncate_output, truncate_tool_output, ContentBlock,
-    Message, Role, TokenUsage, ToolCall, ToolResult, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_OUTPUT_ITEMS,
-    TRUNCATION_BYTE_NOTICE,
+    FailureTombstone, Message, Role, TokenUsage, ToolCall, ToolResult, MAX_TOOL_OUTPUT_BYTES,
+    MAX_TOOL_OUTPUT_ITEMS, TRUNCATION_BYTE_NOTICE,
 };
 pub use traits::{
-    Agent, AgentMiddleware, AlwaysApprovePolicy, ApprovalDecision, BoxFuture, ContextProcessor,
-    PermissionCategory, SandboxPolicy, SessionNode, SessionStore, SkillDefinition, StepOutcome,
-    TaskDispatcher, Tool, ToolApprovalPolicy, ToolContext,
+    Agent, AgentMiddleware, AlwaysApprovePolicy, ApprovalDecision, BoxFuture, CodePatcher,
+    CommandIsolationEngine, ContextProcessor, GrammarLoader, IsolatedCommandSpec,
+    PatchApplicationResult, PatchBlock, PermissionCategory, SandboxPolicy, SemanticAnalyzer,
+    SessionNode, SessionStore, SkillDefinition, StepOutcome, SymbolLocation, TaskDispatcher, Tool,
+    ToolApprovalPolicy, ToolContext, WorkspaceManager, WorkspaceProposal, WorktreeScope,
 };
+
+pub use serde;
+pub use serde_json;

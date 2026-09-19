@@ -9,11 +9,13 @@
 //! - [`StandardSandboxPolicy`]: Integrated implementation of [`kai_core::traits::SandboxPolicy`].
 
 pub mod command;
+pub mod isolation;
 pub mod matrix;
 pub mod path;
 pub mod policy;
 
 pub use command::{CommandSanitizer, BLOCKED_ENV_SUBSTRINGS};
+pub use isolation::BubblewrapIsolationEngine;
 pub use matrix::{AccessDecision, PermissionMatrix};
 pub use path::PathResolver;
 pub use policy::{SandboxPolicyBuilder, StandardSandboxPolicy};

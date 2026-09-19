@@ -160,9 +160,27 @@ impl AutoCompactor {
             summary
         };
 
+        // Preserve all failure tombstones and negative constraints from compacted turns
+        let mut tombstones = Vec::new();
+        for node in older_nodes {
+            let text = node.message.text_content();
+            if text.contains(crate::tombstone::TOMBSTONE_TAG) {
+                tombstones.push(text);
+            }
+        }
+
+        let final_summary = if !tombstones.is_empty() {
+            format!(
+                "{compacted_summary}\n\n### PRESERVED FAILURE TOMBSTONES (Anti-Amnesia):\n{}",
+                tombstones.join("\n\n")
+            )
+        } else {
+            compacted_summary
+        };
+
         let now = current_timestamp_ms();
         let compact_node_id = format!("compact_{now}_{split_idx}");
-        let compact_msg = Message::system(format!("msg_{compact_node_id}"), compacted_summary);
+        let compact_msg = Message::system(format!("msg_{compact_node_id}"), final_summary);
 
         // 2. The compaction node becomes a root or links to parents of the first compacted node
         let compact_node = if !older_nodes[0].parent_ids.is_empty() {

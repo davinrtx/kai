@@ -567,6 +567,140 @@ pub trait TaskDispatcher: Send + Sync {
     ) -> BoxFuture<'a, Result<String>>;
 }
 
+/// Contract for robust source code modification using fuzzy matching and AST targeting.
+pub trait CodePatcher: Send + Sync {
+    /// Applies a series of SEARCH/REPLACE blocks over the target file content.
+    fn apply_blocks<'a>(
+        &'a self,
+        file_path: &'a Path,
+        content: &'a str,
+        patch_blocks: &'a [PatchBlock],
+    ) -> Result<PatchApplicationResult>;
+}
+
+/// An atomic search-and-replace modification block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchBlock {
+    /// Target code snippet to search for.
+    pub search: String,
+    /// Code snippet to substitute in place of the search target.
+    pub replace: String,
+}
+
+impl PatchBlock {
+    /// Constructs a new [`PatchBlock`].
+    pub fn new(search: impl Into<String>, replace: impl Into<String>) -> Self {
+        Self {
+            search: search.into(),
+            replace: replace.into(),
+        }
+    }
+}
+
+/// Result of applying code patch blocks with diagnostic confidence metrics.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PatchApplicationResult {
+    /// Final modified source code after applying all patch blocks.
+    pub modified_content: String,
+    /// Number of blocks successfully applied.
+    pub applied_count: usize,
+    /// Average confidence score [0.0, 1.0] across all applied blocks.
+    pub confidence_score: f64,
+}
+
+/// Contract for isolated workspace provisioning and ephemeral git worktree management.
+pub trait WorkspaceManager: Send + Sync {
+    /// Scope handle managing the lifecycle of an ephemeral worktree.
+    type Handle: WorktreeScope;
+
+    /// Provisions an ephemeral worktree isolated from the parent repository.
+    fn create_ephemeral_worktree<'a>(
+        &'a self,
+        agent_id: &'a str,
+        commit_ish: &'a str,
+    ) -> BoxFuture<'a, Result<Self::Handle>>;
+}
+
+/// Handle to an active ephemeral worktree providing scoped filesystem access and RAII cleanup.
+pub trait WorktreeScope: Send + Sync {
+    /// Absolute filesystem path to the root of the ephemeral worktree.
+    fn path(&self) -> &Path;
+
+    /// Generates a structured proposal summarizing mutations made in this isolated worktree.
+    fn generate_proposal(&self) -> Result<WorkspaceProposal>;
+}
+
+/// Immutable mutation proposal produced by an isolated sub-agent for root approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceProposal {
+    /// Identifier of the sub-agent that produced the proposal.
+    pub agent_id: String,
+    /// Git commit SHA of the base commit on which the proposal was authored.
+    pub base_commit: String,
+    /// Compact summary of modified files and line deltas (equivalent to git diff --stat).
+    pub diff_stat: String,
+    /// Complete unified patch payload representing the proposed changes.
+    pub patch_payload: String,
+}
+
+/// Contract for deep semantic code inspection bridging syntax and type systems.
+pub trait SemanticAnalyzer: Send + Sync {
+    /// Resolves the source definition location of a symbol at the given line and character.
+    fn goto_definition<'a>(
+        &'a self,
+        file_path: &'a Path,
+        line: u32,
+        character: u32,
+    ) -> BoxFuture<'a, Result<Option<SymbolLocation>>>;
+
+    /// Retrieves hover documentation, type signature, and macro expansion for a symbol.
+    fn hover_info<'a>(
+        &'a self,
+        file_path: &'a Path,
+        line: u32,
+        character: u32,
+    ) -> BoxFuture<'a, Result<Option<String>>>;
+}
+
+/// Resolved source code location identifying a symbol definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolLocation {
+    /// Target file path containing the definition.
+    pub path: PathBuf,
+    /// Zero-based starting line number.
+    pub line_start: u32,
+    /// Zero-based ending line number.
+    pub line_end: u32,
+}
+
+/// Contract for kernel-level process confinement and filesystem sandboxing.
+pub trait CommandIsolationEngine: Send + Sync {
+    /// Wraps a command specification within an unprivileged sandbox container (e.g. Landlock/Bubblewrap).
+    fn wrap_command(
+        &self,
+        command: &str,
+        working_dir: &Path,
+        allow_network: bool,
+    ) -> Result<IsolatedCommandSpec>;
+}
+
+/// Structured specification of an isolated process execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedCommandSpec {
+    /// Executable binary to spawn (e.g. `/usr/bin/bwrap` or `/bin/sh`).
+    pub program: PathBuf,
+    /// CLI arguments passed to the binary.
+    pub args: Vec<String>,
+    /// Scrubbed and sanitized environment variables.
+    pub env: Vec<(String, String)>,
+}
+
+/// Contract for dynamic grammar resolution and AST parser loading.
+pub trait GrammarLoader: Send + Sync {
+    /// Returns whether the loader supports the given programming language identifier.
+    fn supports_language(&self, language: &str) -> bool;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
