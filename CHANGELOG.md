@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-09-18
+## [0.6.1] - 2026-09-18
+
+### Added
+- `kai-core`: Dedicated high-concurrency event bus broadcast and multi-byte UTF-8 boundary safety stress suite (`stress_core_event_bus.rs`).
+- `kai-tools`: High-concurrency window reader, transactional atomic rollback under corrupt hunk mismatch, and concurrent MCP tool dispatches (`stress_tools_concurrency.rs`).
+- `kai-orchestrator`: Multi-agent fleet permit throttling, inbox backpressure saturation, and global cooperative steering interruption stress suite (`stress_orchestration_fleet.rs`).
+- `kai-session`: Deep 100-turn linear compaction, 5-branch divergent DAG merge trees, and concurrent multi-worker DAG stress suite (`stress_session_compaction.rs`).
+- `kai-sandbox`: Adversarial security stress suite covering traversal variants, credential shield evasion, and command injection attacks (`stress_sandbox_attacks.rs`).
+
+### Fixed
+- `kai-sandbox`: Normalized cross-platform backslashes `\` to forward slashes `/` in `canonicalize_path` to prevent path traversal evasion on Unix platforms.
+- `kai-sandbox`: Added multi-dot component detection in `canonicalize_path` rejecting evasion attempts using sequences of dots longer than 2 (e.g. `....//`).
+- `kai-sandbox`: Expanded credential shield pattern matching in `is_protected_resource` to match substring credential and secret files (`my_credentials.json`, `app_secrets.yaml`).
 
 ### Added
 - `kai-sandbox`: Canonical path resolution engine (`PathResolver`) strictly enforcing workspace boundary containment and handling non-existent atomic file targets.
