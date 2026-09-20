@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-09-19
+
+### Fixed
+- `kai-tools`: Fuzzy patcher (`FuzzyBlockPatcher`) now detects and strictly preserves original line endings (`\r\n` vs `\n`) and end-of-file trailing newline states.
+- `kai-tools`: Fuzzy patcher now adapts base indentation (`leading_indentation`) so that replacement blocks inserted into indented functions or nested structures retain the target file's indentation level.
+- `kai-session`: Failure tombstone parsing (`collect_tombstones`) is now CRLF-agnostic, preventing silent Anti-Amnesia failure on Windows systems.
+- `kai-orchestrator`: Worktree provisioning (`create_ephemeral_worktree`) transitioned from blocking synchronous subprocess calls to asynchronous `tokio::process::Command`, preventing Tokio worker thread stalls.
+- `kai-orchestrator`: Mutation proposals (`generate_proposal`) now stage untracked files with intent-to-add (`git add -N .`), ensuring newly created files are captured in `git diff HEAD`.
+- `kai-tools`: Subprocess command execution (`ExecCommandTool`) now scrubs sensitive host environment variables (`*_API_KEY`, `*_SECRET`, `*_TOKEN`, `SSH_*`, `AWS_*`, `GITHUB_*`, `DATABASE_URL`) by default to prevent secret leakage.
+
 ## [0.6.3] - 2026-09-19
 
 ### Added
