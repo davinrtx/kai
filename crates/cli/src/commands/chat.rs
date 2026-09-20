@@ -1,5 +1,6 @@
 //! Handler for the `kai chat` subcommand (interactive multi-turn REPL).
 
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -22,17 +23,494 @@ use crate::agent::LlmAgent;
 use crate::args::ChatCommand;
 use crate::client::ModelClient;
 use crate::completion::KaiHelper;
-use crate::config::KaiConfig;
+use crate::config::{KaiConfig, KaiConfigFile};
 use crate::error::Result;
 use crate::ui::{self, CliApprovalPolicy};
 
+/// Reads a single line of user input from standard input with a prompt.
+fn prompt_line(prompt: &str) -> String {
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+    let mut buffer = String::new();
+    let _ = io::stdin().read_line(&mut buffer);
+    buffer.trim().to_string()
+}
+
+const OPENROUTER_MODELS: &[(&str, &str)] = &[
+    (
+        "nvidia/nemotron-3.5-lightning:free",
+        "Nvidia Nemotron 3.5 Lightning (Free tier with tool calling)",
+    ),
+    (
+        "cohere/north-mini-code:free",
+        "Cohere North Mini Code (Free coding model with tool calling)",
+    ),
+    (
+        "deepseek/deepseek-chat",
+        "DeepSeek V3 (Paid, high speed & cost-effective)",
+    ),
+    (
+        "deepseek/deepseek-r1",
+        "DeepSeek R1 (Paid, advanced reasoning)",
+    ),
+    ("openai/gpt-4o", "OpenAI GPT-4o (Paid, omni multimodal)"),
+    (
+        "meta-llama/llama-3.3-70b-instruct",
+        "Llama 3.3 70B (Paid, open-weights flagship)",
+    ),
+];
+
+const OPENAI_MODELS: &[(&str, &str)] = &[
+    ("gpt-4o", "GPT-4o (Flagship reasoning & multimodal)"),
+    ("gpt-4o-mini", "GPT-4o Mini (Fast, lightweight)"),
+    ("o1-preview", "OpenAI o1 (Deep reasoning)"),
+    ("o1-mini", "OpenAI o1-mini (Fast reasoning)"),
+];
+
+const DEEPSEEK_MODELS: &[(&str, &str)] = &[
+    (
+        "deepseek-chat",
+        "DeepSeek V3 (High capability coding & general)",
+    ),
+    (
+        "deepseek-reasoner",
+        "DeepSeek R1 (Chain-of-thought reasoning)",
+    ),
+];
+
+const GROQ_MODELS: &[(&str, &str)] = &[
+    (
+        "llama-3.3-70b-versatile",
+        "Llama 3.3 70B Versatile (Ultra-low latency)",
+    ),
+    (
+        "llama-3.1-8b-instant",
+        "Llama 3.1 8B Instant (Ultra-fast response)",
+    ),
+    (
+        "deepseek-r1-distill-llama-70b",
+        "DeepSeek R1 Distill 70B (Fast reasoning)",
+    ),
+    ("mixtral-8x7b-32768", "Mixtral 8x7B (32k context MoE)"),
+];
+
+const LOCAL_RECOMMENDED_MODELS: &[(&str, &str)] = &[
+    (
+        "qwen2.5-coder:7b",
+        "Qwen 2.5 Coder 7B (Optimal coding on consumer GPU/CPU)",
+    ),
+    (
+        "llama3.1:8b",
+        "Llama 3.1 8B (Versatile general engineering)",
+    ),
+    (
+        "deepseek-coder-v2:16b",
+        "DeepSeek Coder V2 16B (Multi-language coding)",
+    ),
+    (
+        "qwen2.5-coder:14b",
+        "Qwen 2.5 Coder 14B (High accuracy coding)",
+    ),
+];
+
+/// Helper to display a numbered list of curated models and prompt the user to pick one or input a custom identifier.
+fn select_model_from_options(provider_name: &str, options: &[(&str, &str)]) -> String {
+    println!("\nAvailable models for {provider_name}:");
+    for (idx, (model_id, desc)) in options.iter().enumerate() {
+        println!("  {:>2}. {} - {}", idx + 1, model_id, desc);
+    }
+    let custom_idx = options.len() + 1;
+    println!("  {:>2}. Other / Custom model name\n", custom_idx);
+
+    let sel = prompt_line(&format!("Select model [1-{custom_idx}] (default: 1): "));
+    let idx: usize = sel.parse().unwrap_or(1);
+    if idx >= 1 && idx <= options.len() {
+        options[idx - 1].0.to_string()
+    } else if idx == custom_idx {
+        let custom = prompt_line("Enter custom model identifier: ");
+        if custom.is_empty() {
+            options[0].0.to_string()
+        } else {
+            custom
+        }
+    } else {
+        options[0].0.to_string()
+    }
+}
+
+/// Sanitizes API key input by stripping CLI command prefixes (/key, /apikey),
+/// HTTP headers (Bearer), quotes, and surrounding whitespace.
+pub fn sanitize_api_key(input: &str) -> Option<String> {
+    let mut s = input.trim().trim_matches('"').trim_matches('\'').trim();
+    for prefix in &[
+        "/key",
+        "/apikey",
+        "Bearer",
+        "bearer",
+        "export API_KEY=",
+        "API_KEY=",
+    ] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            s = rest.trim();
+        }
+    }
+    let cleaned = s
+        .trim_start_matches('=')
+        .trim_start_matches(':')
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+/// Helper to select a model from live discovered models or fall back to curated options.
+fn select_model_from_catalog(
+    provider_name: &str,
+    discovered: &[crate::discovery::DiscoveredModel],
+    fallback_options: &[(&str, &str)],
+) -> String {
+    if discovered.is_empty() {
+        println!("\nNo live models found or query timed out. Using curated models.");
+        return select_model_from_options(provider_name, fallback_options);
+    }
+
+    if discovered.len() <= 25 {
+        println!(
+            "\nAvailable models for {provider_name} ({} discovered):",
+            discovered.len()
+        );
+        for (idx, m) in discovered.iter().enumerate() {
+            let desc = m
+                .description
+                .as_deref()
+                .map(|d| format!(" - {d}"))
+                .unwrap_or_default();
+            println!("  {:>2}. {}{}", idx + 1, m.id, desc);
+        }
+        let custom_idx = discovered.len() + 1;
+        println!("  {:>2}. Other / Custom model name\n", custom_idx);
+
+        let sel = prompt_line(&format!(
+            "Select model [1-{custom_idx}] or type model name (default: 1): "
+        ));
+        if sel.is_empty() {
+            return discovered[0].id.clone();
+        }
+        if let Ok(idx) = sel.parse::<usize>() {
+            if idx >= 1 && idx <= discovered.len() {
+                return discovered[idx - 1].id.clone();
+            } else if idx == custom_idx {
+                let custom = prompt_line("Enter custom model identifier: ");
+                return if custom.is_empty() {
+                    discovered[0].id.clone()
+                } else {
+                    custom
+                };
+            }
+        }
+        // Direct model identifier entered
+        return sel;
+    }
+
+    // Catalog has > 25 models (e.g. OpenRouter with 400+ models).
+    // Prioritize recommended curated models that exist in the live catalog,
+    // followed by other discovered models up to 15 entries.
+    let mut displayed: Vec<&crate::discovery::DiscoveredModel> = Vec::new();
+    for (rec_id, _) in fallback_options {
+        if let Some(m) = discovered.iter().find(|m| m.id == *rec_id) {
+            displayed.push(m);
+        }
+    }
+    for m in discovered {
+        if !displayed.iter().any(|d| d.id == m.id) {
+            displayed.push(m);
+            if displayed.len() >= 15 {
+                break;
+            }
+        }
+    }
+
+    println!(
+        "\nDiscovered {} live models from {provider_name}.",
+        discovered.len()
+    );
+    println!("Popular / recommended models:");
+    for (idx, m) in displayed.iter().enumerate() {
+        let desc = m
+            .description
+            .as_deref()
+            .map(|d| format!(" - {d}"))
+            .unwrap_or_default();
+        println!("  {:>2}. {}{}", idx + 1, m.id, desc);
+    }
+    let filter_idx = displayed.len() + 1;
+    let custom_idx = displayed.len() + 2;
+    println!(
+        "  {:>2}. Filter / search all {} discovered models",
+        filter_idx,
+        discovered.len()
+    );
+    println!("  {:>2}. Other / Custom model name\n", custom_idx);
+
+    let sel = prompt_line(&format!(
+        "Select [1-{custom_idx}] or type model name (default: 1): "
+    ));
+    if sel.is_empty() {
+        return displayed[0].id.clone();
+    }
+    if let Ok(idx) = sel.parse::<usize>() {
+        if idx >= 1 && idx <= displayed.len() {
+            return displayed[idx - 1].id.clone();
+        } else if idx == filter_idx {
+            let filter =
+                prompt_line("Enter search term (e.g. claude, deepseek, gpt, qwen, llama): ");
+            let filter_lower = filter.to_lowercase();
+            let matches: Vec<&crate::discovery::DiscoveredModel> = discovered
+                .iter()
+                .filter(|m| {
+                    m.id.to_lowercase().contains(&filter_lower)
+                        || m.description
+                            .as_deref()
+                            .map(|d| d.to_lowercase().contains(&filter_lower))
+                            .unwrap_or(false)
+                })
+                .take(20)
+                .collect();
+
+            if matches.is_empty() {
+                println!("No live models matched '{filter}'. Using custom identifier: {filter}");
+                return if filter.is_empty() {
+                    displayed[0].id.clone()
+                } else {
+                    filter
+                };
+            }
+
+            println!("\nMatching models for '{filter}':");
+            for (m_idx, m) in matches.iter().enumerate() {
+                let desc = m
+                    .description
+                    .as_deref()
+                    .map(|d| format!(" - {d}"))
+                    .unwrap_or_default();
+                println!("  {:>2}. {}{}", m_idx + 1, m.id, desc);
+            }
+            let sub_sel = prompt_line(&format!(
+                "Select model [1-{}] (default: 1): ",
+                matches.len()
+            ));
+            let sub_idx: usize = sub_sel.parse().unwrap_or(1);
+            return if sub_idx >= 1 && sub_idx <= matches.len() {
+                matches[sub_idx - 1].id.clone()
+            } else {
+                matches[0].id.clone()
+            };
+        } else if idx == custom_idx {
+            let custom = prompt_line("Enter custom model identifier: ");
+            return if custom.is_empty() {
+                displayed[0].id.clone()
+            } else {
+                custom
+            };
+        }
+    }
+
+    // Direct model name entered
+    sel
+}
+
+/// Interactive onboarding wizard invoked on first run or when no inference model is configured.
+async fn run_onboarding_wizard(
+    working_dir: &Path,
+    config: &mut KaiConfig,
+    probe_client: &reqwest::Client,
+    discovery_cache: &crate::discovery::DiscoveryCache,
+) {
+    println!("\n{}", ui::horizontal_separator());
+    println!("             Welcome to KAI (Krill Agent Interface)");
+    println!("{}\n", ui::horizontal_separator());
+    println!("No inference provider is currently configured.");
+    println!("Select an inference provider to get started:\n");
+    println!("  1. Local Provider (Ollama, LM Studio, LocalAI)");
+    println!("  2. Cloud / Internet (OpenRouter, OpenAI, DeepSeek, Groq)");
+    println!("  3. Skip for now (configure manually via /model and /key)\n");
+
+    let choice = prompt_line("Select [1-3] (default: 1): ");
+    let choice_str = if choice.is_empty() {
+        "1"
+    } else {
+        choice.as_str()
+    };
+
+    match choice_str {
+        "1" => {
+            println!("\nScanning local endpoints (localhost:11434 and localhost:1234)...");
+            let models = crate::discovery::discover_all_local_models(
+                probe_client,
+                Some(&config.base_url),
+                config.api_key.as_deref(),
+                discovery_cache,
+            )
+            .await;
+
+            if !models.is_empty() {
+                println!("\nDiscovered local models:");
+                for (idx, m) in models.iter().enumerate() {
+                    let desc = m
+                        .description
+                        .as_deref()
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default();
+                    println!("  {:>2}. {} [{}]{}", idx + 1, m.id, m.provider, desc);
+                }
+                let sel = prompt_line(&format!(
+                    "\nSelect model [1-{}] (default: 1): ",
+                    models.len()
+                ));
+                let idx: usize = sel.parse().unwrap_or(1);
+                if idx >= 1 && idx <= models.len() {
+                    let chosen = &models[idx - 1];
+                    config.model = chosen.id.clone();
+                    config.base_url = chosen.endpoint.clone();
+                } else {
+                    let chosen = &models[0];
+                    config.model = chosen.id.clone();
+                    config.base_url = chosen.endpoint.clone();
+                }
+            } else {
+                println!(
+                    "\nNo running local servers detected on localhost:11434 or localhost:1234."
+                );
+                let url = prompt_line("Enter endpoint URL (default: http://localhost:11434/v1): ");
+                config.base_url = if url.is_empty() {
+                    crate::config::DEFAULT_BASE_URL.to_string()
+                } else {
+                    url
+                };
+
+                config.model =
+                    select_model_from_options("Local / Ollama", LOCAL_RECOMMENDED_MODELS);
+            }
+
+            let key_input = prompt_line("Enter API key (press Enter to leave blank for local): ");
+            config.api_key = sanitize_api_key(&key_input);
+
+            let mut file_cfg = KaiConfigFile::load(working_dir).unwrap_or_default();
+            file_cfg.base_url = Some(config.base_url.clone());
+            file_cfg.model = Some(config.model.clone());
+            file_cfg.api_key = config.api_key.clone();
+            if let Ok(path) = file_cfg.save(working_dir) {
+                println!("\nConfiguration saved to {}", path.display());
+            }
+        }
+        "2" => {
+            println!("\nSelect Cloud Provider:");
+            println!("  1. OpenRouter (https://openrouter.ai/api/v1) [recommended]");
+            println!("  2. OpenAI (https://api.openai.com/v1)");
+            println!("  3. DeepSeek (https://api.deepseek.com/v1)");
+            println!("  4. Groq (https://api.groq.com/openai/v1)");
+            println!("  5. Custom Endpoint URL\n");
+
+            let prov_sel = prompt_line("Select [1-5] (default: 1): ");
+            let prov_sel_str = if prov_sel.is_empty() {
+                "1"
+            } else {
+                prov_sel.as_str()
+            };
+
+            let (prov_name, base_url, fallback_models) = match prov_sel_str {
+                "2" => (
+                    "OpenAI",
+                    "https://api.openai.com/v1".to_string(),
+                    OPENAI_MODELS,
+                ),
+                "3" => (
+                    "DeepSeek",
+                    "https://api.deepseek.com/v1".to_string(),
+                    DEEPSEEK_MODELS,
+                ),
+                "4" => (
+                    "Groq",
+                    "https://api.groq.com/openai/v1".to_string(),
+                    GROQ_MODELS,
+                ),
+                "5" => {
+                    let url =
+                        prompt_line("Enter endpoint URL (default: https://openrouter.ai/api/v1): ");
+                    let resolved_url = if url.is_empty() {
+                        "https://openrouter.ai/api/v1".to_string()
+                    } else {
+                        url
+                    };
+                    ("Custom Provider", resolved_url, OPENROUTER_MODELS)
+                }
+                _ => (
+                    "OpenRouter",
+                    "https://openrouter.ai/api/v1".to_string(),
+                    OPENROUTER_MODELS,
+                ),
+            };
+
+            config.base_url = base_url;
+
+            let key_input = prompt_line(&format!(
+                "Enter API key for {prov_name} (press Enter to leave blank / skip): "
+            ));
+            config.api_key = sanitize_api_key(&key_input);
+
+            println!("\nQuerying {prov_name} for available models...");
+            let discovered = crate::discovery::probe_endpoint(
+                probe_client,
+                &config.base_url,
+                config.api_key.as_deref(),
+                discovery_cache,
+            )
+            .await
+            .unwrap_or_default();
+
+            config.model = select_model_from_catalog(prov_name, &discovered, fallback_models);
+
+            let mut file_cfg = KaiConfigFile::load(working_dir).unwrap_or_default();
+            file_cfg.base_url = Some(config.base_url.clone());
+            file_cfg.model = Some(config.model.clone());
+            file_cfg.api_key = config.api_key.clone();
+            if let Ok(path) = file_cfg.save(working_dir) {
+                println!("\nConfiguration saved to {}", path.display());
+            }
+        }
+        _ => {
+            println!(
+                "\nConfiguration skipped. You can configure anytime using '/model <name> [endpoint]' and '/key <token>'."
+            );
+        }
+    }
+    println!();
+}
+
 /// Executes an interactive conversational REPL loop.
-pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
+pub async fn execute(_cmd: ChatCommand, mut config: KaiConfig) -> Result<()> {
     let working_dir = config.canonical_working_dir()?;
     let kai_dir = working_dir.join(".kai");
     let session_dir = kai_dir.join("sessions");
     std::fs::create_dir_all(&session_dir).map_err(KaiError::Io)?;
     let history_file = kai_dir.join("history");
+
+    let probe_client = reqwest::Client::new();
+    let discovery_cache = crate::discovery::global_discovery_cache();
+
+    let config_file_exists = KaiConfigFile::locate(&working_dir).is_some();
+    let is_unconfigured =
+        config.model == crate::config::UNCONFIGURED_MODEL || config.model.is_empty();
+
+    if (!config_file_exists || is_unconfigured) && std::io::stdin().is_terminal() {
+        run_onboarding_wizard(&working_dir, &mut config, &probe_client, &discovery_cache).await;
+    }
 
     let mut session_id = format!("session-chat-{}", current_timestamp_ms());
 
@@ -66,7 +544,7 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
     ));
 
     let tools = default_tools();
-    let tool_schemas: Vec<serde_json::Value> = tools.iter().map(|t| t.schema()).collect();
+    let tool_schemas = crate::client::build_tool_schemas(&tools);
 
     let agent = Arc::new(Mutex::new(
         LlmAgent::new(
@@ -106,6 +584,7 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
             .with_max_turns(config.max_turns)
             .with_approval_policy(Arc::new(CliApprovalPolicy::new(config.auto_approve)))
             .with_tool_cache(Arc::new(ToolResultCache::default()))
+            .with_compressor(Arc::new(kai_context::SemanticCommandCompressor::new()))
             .with_event_bus(event_bus);
 
     for tool in tools {
@@ -146,8 +625,6 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
         let _ = rl.load_history(&history_file);
     }
 
-    let probe_client = reqwest::Client::new();
-    let discovery_cache = crate::discovery::global_discovery_cache();
     let mut last_discovered: Vec<crate::discovery::DiscoveredModel> = Vec::new();
 
     // Proactively scan for models in the background to populate Tab completion
@@ -170,23 +647,23 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
     });
 
     loop {
-        // Render turn-based status bar
-        let (active_model, accumulated_tokens) = {
+        let active_model = {
             let a = agent.lock().await;
-            (a.model().to_string(), a.accumulated_tokens())
+            a.model().to_string()
         };
         let git_branch = ui::detect_git_branch(&working_dir);
-        let session_branch = branch_mgr.active_branch().await;
 
-        ui::print_status_bar(
-            &active_model,
-            accumulated_tokens,
-            git_branch.as_deref(),
-            &session_branch,
-        );
+        // Top horizontal separator line
+        ui::signal::ensure_console_mode();
+        println!("{}", ui::horizontal_separator());
 
-        let prompt_str = format!("  {}{}kai ❯{} ", ui::bold(), ui::cyan(), ui::reset());
-        let readline = rl.readline(&prompt_str);
+        let readline = rl.readline("> ");
+
+        // Bottom horizontal separator line
+        println!("{}", ui::horizontal_separator());
+
+        // Status footer line: shortcuts on left, status badges on right
+        ui::print_prompt_footer(&active_model, git_branch.as_deref(), config.auto_approve);
 
         let line = match readline {
             Ok(l) => {
@@ -194,6 +671,7 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 l
             }
             Err(ReadlineError::Interrupted) => {
+                ui::signal::reset();
                 println!("^C (type /exit to quit)");
                 continue;
             }
@@ -226,13 +704,22 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 println!("Conversation history cleared.");
                 continue;
             }
+            ["/cancel"] => {
+                println!("No active turn is currently running. Press Ctrl+C while waiting for a response to cancel an active turn.");
+                continue;
+            }
             ["/tools"] => {
                 let _ = crate::commands::tools::execute(crate::args::ToolsCommand { json: false });
                 continue;
             }
-            ["/help"] => {
+            ["?"] | ["/help"] => {
                 println!("\nAvailable commands:");
                 println!("  /model [name] [endpoint]  - View, switch, or probe inference models and endpoints");
+                println!(
+                    "  /model setup              - Run interactive model & provider setup wizard"
+                );
+                println!("  /key [token|clear]        - View, set, or clear runtime API key");
+                println!("  /config                   - View persistent configuration (.kai/config.json)");
                 println!("  /reasoning [on|off]       - Toggle or set internal reasoning (<think>) visibility");
                 println!("  /sessions                 - List all saved sessions in .kai/sessions");
                 println!("  /resume <id>              - Resume past session ID and restore conversational history");
@@ -255,10 +742,122 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 println!("  @path or @file:path       - Attach file contents directly to prompt (bounded to 4 KB)\n");
                 continue;
             }
-            ["/model"] => {
-                let (curr_model, curr_url) = {
+            ["/config"] => {
+                let (model, base_url, api_key_masked) = {
                     let a = agent.lock().await;
-                    (a.model().to_string(), a.base_url().to_string())
+                    let masked = match a.api_key() {
+                        Some(k) if !k.is_empty() => {
+                            if k.len() > 8 {
+                                format!("configured ({}...{})", &k[..4], &k[k.len() - 4..])
+                            } else {
+                                "configured (****)".to_string()
+                            }
+                        }
+                        _ => "unconfigured".to_string(),
+                    };
+                    (a.model().to_string(), a.base_url().to_string(), masked)
+                };
+                let cfg_loc = KaiConfigFile::locate(&working_dir)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| {
+                        working_dir
+                            .join(".kai")
+                            .join("config.json")
+                            .display()
+                            .to_string()
+                    });
+
+                println!("\nKAI Configuration ({cfg_loc}):");
+                println!("  Base URL:  {base_url}");
+                println!("  Model:     {model}");
+                println!("  API Key:   {api_key_masked}\n");
+                continue;
+            }
+            ["/key"] | ["/apikey"] => {
+                let key_opt = {
+                    let a = agent.lock().await;
+                    a.api_key().map(String::from)
+                };
+                match key_opt {
+                    Some(k) if !k.is_empty() => {
+                        let masked = if k.len() > 8 {
+                            format!("{}...{}", &k[..4], &k[k.len() - 4..])
+                        } else {
+                            "****".to_string()
+                        };
+                        println!("Active API Key: {masked}");
+                    }
+                    _ => {
+                        println!("Active API Key: [none configured]");
+                        println!("Set key using: /key <token> or /key clear");
+                    }
+                }
+                continue;
+            }
+            ["/key", "clear"] | ["/apikey", "clear"] => {
+                let mut a = agent.lock().await;
+                a.set_api_key(None);
+                println!("API key cleared.");
+                let mut file_cfg = KaiConfigFile::load(&working_dir).unwrap_or_default();
+                file_cfg.api_key = None;
+                let _ = file_cfg.save(&working_dir);
+                continue;
+            }
+            _ if trimmed.starts_with("/key") || trimmed.starts_with("/apikey") => {
+                let raw = if let Some(rest) = trimmed.strip_prefix("/apikey") {
+                    rest
+                } else {
+                    trimmed.strip_prefix("/key").unwrap_or("")
+                };
+                let raw_clean = raw
+                    .trim()
+                    .trim_start_matches('=')
+                    .trim_start_matches(':')
+                    .trim();
+                if raw_clean == "clear" {
+                    let mut a = agent.lock().await;
+                    a.set_api_key(None);
+                    println!("API key cleared.");
+                    let mut file_cfg = KaiConfigFile::load(&working_dir).unwrap_or_default();
+                    file_cfg.api_key = None;
+                    let _ = file_cfg.save(&working_dir);
+                    continue;
+                }
+                let clean_key = match sanitize_api_key(raw) {
+                    Some(k) => k,
+                    None => {
+                        println!("Usage: /key <token> or /key clear");
+                        continue;
+                    }
+                };
+                let mut a = agent.lock().await;
+                a.set_api_key(Some(clean_key.clone()));
+                let masked = if clean_key.len() > 8 {
+                    format!(
+                        "{}...{}",
+                        &clean_key[..4],
+                        &clean_key[clean_key.len() - 4..]
+                    )
+                } else {
+                    "****".to_string()
+                };
+                println!("API key configured: {masked}");
+
+                let mut file_cfg = KaiConfigFile::load(&working_dir).unwrap_or_default();
+                file_cfg.api_key = Some(clean_key);
+                if let Ok(path) = file_cfg.save(&working_dir) {
+                    println!("Saved API key to {}", path.display());
+                }
+                continue;
+            }
+            ["/model"] => {
+                let (curr_model, curr_url, curr_key) = {
+                    let a = agent.lock().await;
+                    (
+                        a.model().to_string(),
+                        a.base_url().to_string(),
+                        a.api_key().map(String::from),
+                    )
                 };
                 let is_unconfigured =
                     curr_model == crate::config::UNCONFIGURED_MODEL || curr_model.is_empty();
@@ -285,7 +884,7 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 let discovered = crate::discovery::discover_all_local_models(
                     &probe_client,
                     Some(&curr_url),
-                    config.api_key.as_deref(),
+                    curr_key.as_deref().or(config.api_key.as_deref()),
                     &discovery_cache,
                 )
                 .await;
@@ -300,6 +899,11 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                     );
                     println!(
                         "Configure manually using: {}/model <name> [endpoint]{}",
+                        ui::cyan(),
+                        ui::reset()
+                    );
+                    println!(
+                        "Or run interactive wizard: {}/model setup{}",
                         ui::cyan(),
                         ui::reset()
                     );
@@ -347,13 +951,33 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 }
                 continue;
             }
+            ["/model", "setup"] => {
+                run_onboarding_wizard(&working_dir, &mut config, &probe_client, &discovery_cache)
+                    .await;
+                let mut a = agent.lock().await;
+                a.set_model(&config.model, Some(config.base_url.clone()));
+                if let Some(ref k) = config.api_key {
+                    a.set_api_key(Some(k.clone()));
+                }
+                println!(
+                    "Model updated to: {}{}{} (endpoint: {})",
+                    ui::bold(),
+                    a.model(),
+                    ui::reset(),
+                    a.base_url()
+                );
+                continue;
+            }
             ["/model", "probe"] => {
-                let curr_url = agent.lock().await.base_url().to_string();
+                let (curr_url, curr_key) = {
+                    let a = agent.lock().await;
+                    (a.base_url().to_string(), a.api_key().map(String::from))
+                };
                 println!("Probing endpoint: {curr_url}...");
                 let found = crate::discovery::probe_endpoint(
                     &probe_client,
                     &curr_url,
-                    config.api_key.as_deref(),
+                    curr_key.as_deref().or(config.api_key.as_deref()),
                     &discovery_cache,
                 )
                 .await;
@@ -383,11 +1007,12 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 continue;
             }
             ["/model", "probe", target_url] => {
+                let curr_key = agent.lock().await.api_key().map(String::from);
                 println!("Probing endpoint: {target_url}...");
                 let found = crate::discovery::probe_endpoint(
                     &probe_client,
                     target_url,
-                    config.api_key.as_deref(),
+                    curr_key.as_deref().or(config.api_key.as_deref()),
                     &discovery_cache,
                 )
                 .await;
@@ -432,6 +1057,29 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                             ui::reset(),
                             a.base_url()
                         );
+
+                        if a.api_key().is_none()
+                            && (!a.base_url().contains("localhost")
+                                && !a.base_url().contains("127.0.0.1"))
+                        {
+                            println!(
+                                "No API key is configured for remote endpoint '{}'.",
+                                a.base_url()
+                            );
+                            let key_input =
+                                prompt_line("Enter API key (press Enter to leave blank): ");
+                            if let Some(clean) = sanitize_api_key(&key_input) {
+                                a.set_api_key(Some(clean));
+                                println!("API key configured.");
+                            }
+                        }
+
+                        let mut file_cfg = KaiConfigFile::load(&working_dir).unwrap_or_default();
+                        file_cfg.model = Some(a.model().to_string());
+                        file_cfg.base_url = Some(a.base_url().to_string());
+                        file_cfg.api_key = a.api_key().map(String::from);
+                        let _ = file_cfg.save(&working_dir);
+
                         continue;
                     }
                 }
@@ -445,6 +1093,27 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                     ui::reset(),
                     a.base_url()
                 );
+
+                if a.api_key().is_none()
+                    && (!a.base_url().contains("localhost") && !a.base_url().contains("127.0.0.1"))
+                {
+                    println!(
+                        "No API key is configured for remote endpoint '{}'.",
+                        a.base_url()
+                    );
+                    let key_input = prompt_line("Enter API key (press Enter to leave blank): ");
+                    if let Some(clean) = sanitize_api_key(&key_input) {
+                        a.set_api_key(Some(clean));
+                        println!("API key configured.");
+                    }
+                }
+
+                let mut file_cfg = KaiConfigFile::load(&working_dir).unwrap_or_default();
+                file_cfg.model = Some(a.model().to_string());
+                file_cfg.base_url = Some(a.base_url().to_string());
+                file_cfg.api_key = a.api_key().map(String::from);
+                let _ = file_cfg.save(&working_dir);
+
                 continue;
             }
             ["/model", new_model, new_endpoint] => {
@@ -457,6 +1126,27 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                     ui::reset(),
                     a.base_url()
                 );
+
+                if a.api_key().is_none()
+                    && (!a.base_url().contains("localhost") && !a.base_url().contains("127.0.0.1"))
+                {
+                    println!(
+                        "No API key is configured for remote endpoint '{}'.",
+                        a.base_url()
+                    );
+                    let key_input = prompt_line("Enter API key (press Enter to leave blank): ");
+                    if let Some(clean) = sanitize_api_key(&key_input) {
+                        a.set_api_key(Some(clean));
+                        println!("API key configured.");
+                    }
+                }
+
+                let mut file_cfg = KaiConfigFile::load(&working_dir).unwrap_or_default();
+                file_cfg.model = Some(a.model().to_string());
+                file_cfg.base_url = Some(a.base_url().to_string());
+                file_cfg.api_key = a.api_key().map(String::from);
+                let _ = file_cfg.save(&working_dir);
+
                 continue;
             }
             ["/reasoning"] => {
@@ -667,11 +1357,22 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 continue;
             }
             ["/status"] => {
-                let (model, base_url, tokens, show_reasoning) = {
+                let (model, base_url, api_key_masked, tokens, show_reasoning) = {
                     let a = agent.lock().await;
+                    let masked = match a.api_key() {
+                        Some(k) if !k.is_empty() => {
+                            if k.len() > 8 {
+                                format!("configured ({}...{})", &k[..4], &k[k.len() - 4..])
+                            } else {
+                                "configured (****)".to_string()
+                            }
+                        }
+                        _ => "unconfigured".to_string(),
+                    };
                     (
                         a.model().to_string(),
                         a.base_url().to_string(),
+                        masked,
                         a.accumulated_tokens(),
                         a.show_reasoning(),
                     )
@@ -688,6 +1389,7 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 println!("\nKAI Session Status:");
                 println!("  Model:              {model}");
                 println!("  Endpoint:           {base_url}");
+                println!("  API Key:            {api_key_masked}");
                 println!("  Git Branch:         {git_branch_str}");
                 println!("  Session ID:         {session_id}");
                 println!("  DAG Branch:         {active_branch}");
@@ -744,8 +1446,8 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
         let active_branch = branch_mgr.active_branch().await;
         let parent_head = branch_mgr.active_head().await.unwrap_or(None);
         let user_node_id = format!("node_{user_now}");
-        let user_node = if let Some(parent) = parent_head {
-            SessionNode::with_parent(&user_node_id, parent, user_msg, user_now)
+        let user_node = if let Some(parent) = &parent_head {
+            SessionNode::with_parent(&user_node_id, parent.clone(), user_msg, user_now)
         } else {
             SessionNode::root(&user_node_id, user_msg, user_now)
         };
@@ -753,7 +1455,12 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
         let _ = session_store.set_head(&active_branch, &user_node.id).await;
 
         // Run engine turns for this user prompt
+        ui::signal::ensure_console_mode();
+        ui::signal::reset();
+        let mut sig_rx = ui::signal::subscribe();
+
         let mut turn_count = 0;
+        let mut cancelled = false;
         loop {
             turn_count += 1;
             if turn_count > config.max_turns {
@@ -764,52 +1471,92 @@ pub async fn execute(_cmd: ChatCommand, config: KaiConfig) -> Result<()> {
                 break;
             }
 
-            match engine.step().await {
-                Ok(StepOutcome::Completed(asst_msg)) => {
-                    let full_text = asst_msg.text_content();
-                    let (thought, clean_text) = ui::parse_reasoning_blocks(&full_text);
+            if ui::signal::was_cancelled() {
+                cancelled = true;
+            } else {
+                let mut step_future = Box::pin(engine.step());
+                let step_outcome = tokio::select! {
+                    biased;
+                    _ = sig_rx.recv() => {
+                        cancelled = true;
+                        None
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        cancelled = true;
+                        None
+                    }
+                    res = &mut step_future => Some(res),
+                };
 
-                    let show_reasoning = agent.lock().await.show_reasoning();
-                    if show_reasoning {
-                        if let Some(ref t) = thought {
-                            ui::print_thought(t);
+                if step_outcome.is_none() {
+                    cancelled = true;
+                } else if let Some(res) = step_outcome {
+                    match res {
+                        Ok(StepOutcome::Completed(asst_msg)) => {
+                            let full_text = asst_msg.text_content();
+                            let (thought, clean_text) = ui::parse_reasoning_blocks(&full_text);
+
+                            let show_reasoning = agent.lock().await.show_reasoning();
+                            if show_reasoning {
+                                if let Some(ref t) = thought {
+                                    ui::print_thought(t);
+                                }
+                            }
+
+                            if !clean_text.is_empty() {
+                                ui::print_assistant_response(&clean_text);
+                            } else if thought.is_some() && !show_reasoning {
+                                ui::print_assistant_response(
+                                    "[Completed internal reasoning. Type '/reasoning on' to view traces.]",
+                                );
+                            }
+
+                            // Record assistant message into session graph
+                            let asst_now = current_timestamp_ms();
+                            let parent_head = branch_mgr.active_head().await.unwrap_or(None);
+                            let asst_node_id = format!("node_{asst_now}");
+                            let asst_node = if let Some(parent) = parent_head {
+                                SessionNode::with_parent(
+                                    &asst_node_id,
+                                    parent,
+                                    asst_msg.clone(),
+                                    asst_now,
+                                )
+                            } else {
+                                SessionNode::root(&asst_node_id, asst_msg.clone(), asst_now)
+                            };
+                            let _ = session_store.put_node(&asst_node).await;
+                            let _ = session_store.set_head(&active_branch, &asst_node.id).await;
+                            let _ = session_store.flush_to_disk().await;
+                            break;
+                        }
+                        Ok(StepOutcome::Continue(_)) => {
+                            // Engine executed tool and enqueued results, proceed to next step
+                            continue;
+                        }
+                        Ok(StepOutcome::Suspended { reason }) => {
+                            ui::print_thought(&format!("Turn suspended: {reason}"));
+                            break;
+                        }
+                        Err(err) => {
+                            ui::print_error(&format!("Engine execution error: {err}"));
+                            break;
                         }
                     }
+                }
+            }
 
-                    if !clean_text.is_empty() {
-                        ui::print_assistant_response(&clean_text);
-                    } else if thought.is_some() && !show_reasoning {
-                        ui::print_assistant_response(
-                            "[Completed internal reasoning. Type '/reasoning on' to view traces.]",
-                        );
-                    }
-
-                    // Record assistant message into session graph
-                    let asst_now = current_timestamp_ms();
-                    let parent_head = branch_mgr.active_head().await.unwrap_or(None);
-                    let asst_node_id = format!("node_{asst_now}");
-                    let asst_node = if let Some(parent) = parent_head {
-                        SessionNode::with_parent(&asst_node_id, parent, asst_msg.clone(), asst_now)
-                    } else {
-                        SessionNode::root(&asst_node_id, asst_msg.clone(), asst_now)
-                    };
-                    let _ = session_store.put_node(&asst_node).await;
-                    let _ = session_store.set_head(&active_branch, &asst_node.id).await;
-                    let _ = session_store.flush_to_disk().await;
-                    break;
+            if cancelled || ui::signal::was_cancelled() {
+                println!("\r                                                                                \r^C [Turn cancelled by user]");
+                ui::signal::reset();
+                if let Some(prev) = &parent_head {
+                    let _ = session_store.set_head(&active_branch, prev).await;
                 }
-                Ok(StepOutcome::Continue(_)) => {
-                    // Engine executed tool and enqueued results, proceed to next step
-                    continue;
+                {
+                    let mut a = agent.lock().await;
+                    a.pop_last_if_user();
                 }
-                Ok(StepOutcome::Suspended { reason }) => {
-                    ui::print_thought(&format!("Turn suspended: {reason}"));
-                    break;
-                }
-                Err(err) => {
-                    ui::print_error(&format!("Engine execution error: {err}"));
-                    break;
-                }
+                break;
             }
         }
     }

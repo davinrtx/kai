@@ -52,7 +52,7 @@ pub async fn execute(_cmd: DaemonCommand, config: KaiConfig) -> Result<()> {
         config.api_key.clone(),
     ));
 
-    let tool_schemas: Vec<serde_json::Value> = tools.iter().map(|t| t.schema()).collect();
+    let tool_schemas = crate::client::build_tool_schemas(&tools);
 
     let agent = Arc::new(Mutex::new(
         LlmAgent::new(
@@ -64,7 +64,8 @@ pub async fn execute(_cmd: DaemonCommand, config: KaiConfig) -> Result<()> {
         .with_tool_schemas(tool_schemas),
     ));
 
-    let mut engine = OrchestrationEngine::new(agent, inbox, &working_dir, "session-daemon-01");
+    let mut engine = OrchestrationEngine::new(agent, inbox, &working_dir, "session-daemon-01")
+        .with_compressor(Arc::new(kai_context::SemanticCommandCompressor::new()));
     for tool in tools {
         engine.register_tool(tool);
     }

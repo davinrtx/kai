@@ -48,6 +48,8 @@ pub trait SandboxPolicy: Send + Sync {
     ) -> std::result::Result<(), crate::error::SandboxError>;
 }
 
+use std::sync::Arc;
+
 /// Operational execution context supplied to tools during invocation.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -59,6 +61,8 @@ pub struct ToolContext {
     pub agent_id: String,
     /// Optional global steering receiver for cooperative cancellation and pause checks.
     pub steering: Option<GlobalSteeringReceiver>,
+    /// Optional command output compressor for pruning tool execution noise.
+    pub compressor: Option<Arc<dyn CommandOutputCompressor>>,
 }
 
 impl ToolContext {
@@ -73,6 +77,7 @@ impl ToolContext {
             session_id: session_id.into(),
             agent_id: agent_id.into(),
             steering: None,
+            compressor: None,
         }
     }
 
@@ -80,6 +85,17 @@ impl ToolContext {
     pub fn with_steering(mut self, steering: GlobalSteeringReceiver) -> Self {
         self.steering = Some(steering);
         self
+    }
+
+    /// Attaches an output compressor to this execution context.
+    pub fn with_compressor(mut self, compressor: Arc<dyn CommandOutputCompressor>) -> Self {
+        self.compressor = Some(compressor);
+        self
+    }
+
+    /// Accesses the attached command output compressor, if configured.
+    pub fn compressor(&self) -> Option<&Arc<dyn CommandOutputCompressor>> {
+        self.compressor.as_ref()
     }
 
     /// Checks whether in-flight execution has been cancelled or terminated.
@@ -254,6 +270,15 @@ pub trait ContextProcessor: Send + Sync {
         messages: &'a [Message],
         target_tokens: usize,
     ) -> BoxFuture<'a, Result<Vec<Message>>>;
+}
+
+/// Contract for compressing and pruning boilerplate from command execution outputs.
+///
+/// Implementations parse and filter command-specific noise (e.g. repetitive compiler status,
+/// passing test logs, or large diffs) to preserve valuable tokens for model context.
+pub trait CommandOutputCompressor: std::fmt::Debug + Send + Sync {
+    /// Compresses raw command output based on the executed command line string and exit code.
+    fn compress(&self, command: &str, output: &str, exit_code: Option<i32>) -> String;
 }
 
 /// A node within the branchable session Directed Acyclic Graph (DAG).

@@ -367,12 +367,18 @@ impl Tool for ExecCommandTool {
 
             let exit_code = status.code().unwrap_or(-1);
 
+            let final_output = if let Some(compressor) = context.compressor() {
+                compressor.compress(&args.command, &combined_output, Some(exit_code))
+            } else {
+                combined_output
+            };
+
             let tool_result = if status.success() {
-                ToolResult::success(self.name(), combined_output)
+                ToolResult::success(self.name(), final_output)
                     .with_exit_code(exit_code)
                     .with_duration_ms(elapsed_ms)
             } else {
-                ToolResult::error(self.name(), combined_output)
+                ToolResult::error(self.name(), final_output)
                     .with_exit_code(exit_code)
                     .with_duration_ms(elapsed_ms)
             };
@@ -404,5 +410,29 @@ mod tests {
         assert!(!ExecCommandTool::is_sensitive_env_var("HOME"));
         assert!(!ExecCommandTool::is_sensitive_env_var("USER"));
         assert!(!ExecCommandTool::is_sensitive_env_var("CARGO_HOME"));
+    }
+
+    #[derive(Debug)]
+    struct MockCompressor;
+
+    impl kai_core::traits::CommandOutputCompressor for MockCompressor {
+        fn compress(&self, _command: &str, output: &str, _exit_code: Option<i32>) -> String {
+            format!("[COMPRESSED] {output}")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_command_uses_compressor() {
+        let tool = ExecCommandTool::new();
+        let compressor = std::sync::Arc::new(MockCompressor);
+        let ctx = ToolContext::new(".", "sess_01", "agent_01").with_compressor(compressor);
+
+        let args = json!({
+            "command": if cfg!(windows) { "echo Hello" } else { "echo 'Hello'" }
+        });
+
+        let res = tool.execute(args, &ctx).await.unwrap();
+        assert!(!res.is_error);
+        assert!(res.output.contains("[COMPRESSED]"));
     }
 }

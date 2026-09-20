@@ -57,9 +57,13 @@ pub struct HttpTransport {
 impl HttpTransport {
     /// Constructs a new [`HttpTransport`].
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .tcp_keepalive(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { client }
     }
 }
 
@@ -81,11 +85,24 @@ impl LlmTransport for HttpTransport {
             headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
             if let Some(key) = api_key {
-                if !key.trim().is_empty() {
-                    let auth_val = format!("Bearer {}", key.trim());
+                let trimmed = key.trim();
+                if !trimmed.is_empty() {
+                    let auth_val = format!("Bearer {trimmed}");
                     if let Ok(val) = HeaderValue::from_str(&auth_val) {
                         headers.insert(AUTHORIZATION, val);
                     }
+                }
+            }
+
+            if url.contains("openrouter.ai") {
+                if let Ok(val) = HeaderValue::from_str("https://github.com/davinrtx/kai") {
+                    headers.insert(
+                        reqwest::header::HeaderName::from_static("http-referer"),
+                        val,
+                    );
+                }
+                if let Ok(val) = HeaderValue::from_str("KAI") {
+                    headers.insert(reqwest::header::HeaderName::from_static("x-title"), val);
                 }
             }
 
@@ -101,13 +118,37 @@ impl LlmTransport for HttpTransport {
             let status = response.status();
             if !status.is_success() {
                 let status_code = status.as_u16();
-                let error_body = response
+                let raw_body = response
                     .text()
                     .await
                     .unwrap_or_else(|_| "Failed to read response body".to_string());
+
+                let error_message = if status_code == 401 {
+                    if raw_body.contains("No cookie auth credentials found") || api_key.is_none() {
+                        format!(
+                            "{raw_body} (Authentication required: No valid API key provided. Set it via '/key <token>' in chat or environment variable OPENROUTER_API_KEY / KAI_API_KEY)"
+                        )
+                    } else {
+                        raw_body
+                    }
+                } else if status_code == 402 {
+                    format!(
+                        "{raw_body} (Insufficient credits on provider. Switch to a free tool-compatible model using '/model nvidia/nemotron-3.5-lightning:free' or '/model cohere/north-mini-code:free', or add credits to your account.)"
+                    )
+                } else if status_code == 404
+                    && (raw_body.contains("No endpoints found that support tool use")
+                        || raw_body.contains("Filter by Tool Compatibility"))
+                {
+                    format!(
+                        "{raw_body} (Model incompatibility: The selected model does not support tool calling on OpenRouter. Switch to a free tool-compatible model using '/model nvidia/nemotron-3.5-lightning:free' or '/model cohere/north-mini-code:free', or a paid model using '/model deepseek/deepseek-chat'.)"
+                    )
+                } else {
+                    raw_body
+                };
+
                 return Err(CliError::Api {
                     status: status_code,
-                    message: error_body,
+                    message: error_message,
                 });
             }
 
@@ -254,15 +295,34 @@ impl ModelClient {
         formatted
     }
 
-    /// Formats tool definitions into the OpenAI function tools schema.
+    /// Formats tool definitions into standard OpenAI function tools schema.
     pub fn format_tools(tool_schemas: &[Value]) -> Vec<Value> {
         tool_schemas
             .iter()
             .map(|schema| {
-                json!({
-                    "type": "function",
-                    "function": schema
-                })
+                if schema.get("type").and_then(|t| t.as_str()) == Some("function") {
+                    schema.clone()
+                } else if schema.get("name").is_some() {
+                    json!({
+                        "type": "function",
+                        "function": schema
+                    })
+                } else {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": schema
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("tool"),
+                            "description": schema
+                                .get("description")
+                                .and_then(|d| d.as_str())
+                                .unwrap_or(""),
+                            "parameters": schema
+                        }
+                    })
+                }
             })
             .collect()
     }
@@ -290,12 +350,37 @@ impl ModelClient {
             }
         }
 
-        let response_json = self
+        let response_result = self
             .transport
             .send_request(&endpoint, self.api_key.as_deref(), &payload)
-            .await?;
+            .await;
 
-        Self::parse_response(&response_json)
+        match response_result {
+            Ok(response_json) => Self::parse_response(&response_json),
+            Err(CliError::Api { status, message })
+                if !tool_schemas.is_empty()
+                    && (status == 404
+                        && (message.contains("No endpoints found that support tool use")
+                            || message.contains("Filter by Tool Compatibility"))
+                        || (status == 400
+                            && (message.to_lowercase().contains("tool")
+                                || message.to_lowercase().contains("function")))) =>
+            {
+                // Fallback: The target model or endpoint does not support native function calling.
+                // Retry without the `tools` parameter so the model operates in conversational mode.
+                let fallback_payload = json!({
+                    "model": self.model,
+                    "messages": formatted_messages,
+                    "temperature": 0.0,
+                });
+                let fallback_json = self
+                    .transport
+                    .send_request(&endpoint, self.api_key.as_deref(), &fallback_payload)
+                    .await?;
+                Self::parse_response(&fallback_json)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Parses the raw JSON response returned by the chat completions API.
@@ -389,4 +474,18 @@ impl ModelClient {
             usage,
         })
     }
+}
+
+/// Builds standard tool schema definitions containing name, description, and parameter schema.
+pub fn build_tool_schemas(tools: &[Arc<dyn kai_core::traits::Tool>]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            json!({
+                "name": t.name(),
+                "description": t.description(),
+                "parameters": t.schema()
+            })
+        })
+        .collect()
 }

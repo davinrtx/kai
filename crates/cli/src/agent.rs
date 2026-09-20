@@ -77,6 +77,11 @@ impl LlmAgent {
         self.client.base_url()
     }
 
+    /// Returns the active inference API key, if configured.
+    pub fn api_key(&self) -> Option<&str> {
+        self.client.api_key()
+    }
+
     /// Dynamically switches the model identifier and optionally the base URL.
     pub fn set_model(&mut self, model: impl Into<String>, base_url: Option<String>) {
         let endpoint = base_url.unwrap_or_else(|| self.client.base_url().to_string());
@@ -85,6 +90,16 @@ impl LlmAgent {
             endpoint,
             model,
             self.client.api_key().map(String::from),
+        ));
+    }
+
+    /// Dynamically updates the inference API key for the active agent.
+    pub fn set_api_key(&mut self, api_key: Option<String>) {
+        self.client = Arc::new(ModelClient::with_transport(
+            self.client.transport().clone(),
+            self.client.base_url(),
+            self.client.model(),
+            api_key,
         ));
     }
 
@@ -113,6 +128,16 @@ impl LlmAgent {
         self.last_turn_tokens = tokens;
         self.accumulated_tokens += tokens;
     }
+
+    /// Removes the trailing user message if a turn was cancelled before completion.
+    pub fn pop_last_if_user(&mut self) -> Option<Message> {
+        if let Some(last) = self.history.last() {
+            if last.role == Role::User {
+                return self.history.pop();
+            }
+        }
+        None
+    }
 }
 
 impl Agent for LlmAgent {
@@ -135,8 +160,11 @@ impl Agent for LlmAgent {
                 self.history.push(msg.clone());
             }
 
+            let mut spinner =
+                crate::ui::Spinner::start(format!("Waiting for {}", self.client.model()));
+
             // Dispatch completion request to model endpoint
-            let response = self
+            let response_result = self
                 .client
                 .complete(&self.system_prompt, &self.history, &self.tool_schemas)
                 .await
@@ -144,7 +172,10 @@ impl Agent for LlmAgent {
                     KaiError::Orchestrator(OrchestratorError::Interrupted {
                         reason: format!("Model inference failure: {err}"),
                     })
-                })?;
+                });
+
+            spinner.stop();
+            let response = response_result?;
 
             let timestamp = current_timestamp_ms();
 
@@ -197,5 +228,36 @@ impl Agent for LlmAgent {
                 Ok(StepOutcome::Completed(assistant_msg))
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::ModelClient;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_pop_last_if_user() {
+        let client = Arc::new(ModelClient::new(
+            "http://localhost:8000",
+            "test-model",
+            None,
+        ));
+        let mut agent = LlmAgent::new("agent-1", "Test Agent", "System", client);
+
+        assert!(agent.pop_last_if_user().is_none());
+
+        agent.history.push(Message::user("msg-1", "User prompt"));
+        let popped = agent.pop_last_if_user();
+        assert!(popped.is_some());
+        assert_eq!(popped.unwrap().text_content(), "User prompt");
+        assert!(agent.pop_last_if_user().is_none());
+
+        agent
+            .history
+            .push(Message::assistant("msg-2", "Assistant reply"));
+        assert!(agent.pop_last_if_user().is_none());
+        assert_eq!(agent.history.len(), 1);
     }
 }

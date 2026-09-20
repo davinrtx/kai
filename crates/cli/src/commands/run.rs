@@ -53,7 +53,7 @@ pub async fn execute(cmd: RunCommand, config: KaiConfig) -> Result<()> {
         config.api_key.clone(),
     ));
 
-    let tool_schemas: Vec<serde_json::Value> = tools.iter().map(|t| t.schema()).collect();
+    let tool_schemas = crate::client::build_tool_schemas(&tools);
 
     let agent = Arc::new(Mutex::new(
         LlmAgent::new(
@@ -72,6 +72,7 @@ pub async fn execute(cmd: RunCommand, config: KaiConfig) -> Result<()> {
         .with_max_turns(config.max_turns)
         .with_approval_policy(Arc::new(CliApprovalPolicy::new(config.auto_approve)))
         .with_tool_cache(Arc::new(ToolResultCache::default()))
+        .with_compressor(Arc::new(kai_context::SemanticCommandCompressor::new()))
         .with_event_bus(event_bus);
 
     for tool in tools {
@@ -107,7 +108,14 @@ pub async fn execute(cmd: RunCommand, config: KaiConfig) -> Result<()> {
         .await
         .map_err(crate::error::CliError::Core)?;
 
-    let outcome = engine.run().await.map_err(crate::error::CliError::Core)?;
+    let outcome = tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c() => {
+            println!("\r\x1b[2K^C [Execution cancelled by user]");
+            return Ok(());
+        }
+        res = engine.run() => res.map_err(crate::error::CliError::Core)?,
+    };
 
     ui::print_assistant_response(&outcome.text_content());
 

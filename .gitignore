@@ -9,3 +9,7 @@ Cargo.lock
 *.exe
 *.old
 .kai/sessions/
+.kai/config.json
+.kai/*.tmp
+graphify-out/
+.agents/

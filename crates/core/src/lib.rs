@@ -29,10 +29,11 @@ pub use message::{
 };
 pub use traits::{
     Agent, AgentMiddleware, AlwaysApprovePolicy, ApprovalDecision, BoxFuture, CodePatcher,
-    CommandIsolationEngine, ContextProcessor, GrammarLoader, IsolatedCommandSpec,
-    PatchApplicationResult, PatchBlock, PermissionCategory, SandboxPolicy, SemanticAnalyzer,
-    SessionNode, SessionStore, SkillDefinition, StepOutcome, SymbolLocation, TaskDispatcher, Tool,
-    ToolApprovalPolicy, ToolContext, WorkspaceManager, WorkspaceProposal, WorktreeScope,
+    CommandIsolationEngine, CommandOutputCompressor, ContextProcessor, GrammarLoader,
+    IsolatedCommandSpec, PatchApplicationResult, PatchBlock, PermissionCategory, SandboxPolicy,
+    SemanticAnalyzer, SessionNode, SessionStore, SkillDefinition, StepOutcome, SymbolLocation,
+    TaskDispatcher, Tool, ToolApprovalPolicy, ToolContext, WorkspaceManager, WorkspaceProposal,
+    WorktreeScope,
 };
 
 pub use serde;

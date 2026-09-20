@@ -121,7 +121,7 @@ impl Completer for KaiHelper {
                             if "probe".starts_with(arg_typed) {
                                 matches.push(Pair {
                                     display: "probe        Probe endpoint for models".to_string(),
-                                    replacement: "probe ".to_string(),
+                                    replacement: "probe".to_string(),
                                 });
                             }
                             if let Ok(guard) = self.discovered_models.read() {
@@ -175,13 +175,13 @@ impl Completer for KaiHelper {
                     }
                 }
 
-                // Base slash command completion
+                // Base slash command completion without trailing space
                 let mut matches = Vec::new();
                 for (cmd, desc) in &self.commands {
                     if cmd.starts_with(typed) {
                         matches.push(Pair {
                             display: format!("{:<14} {}", cmd, desc),
-                            replacement: format!("{cmd} "),
+                            replacement: cmd.to_string(),
                         });
                     }
                 }
@@ -210,7 +210,7 @@ impl Completer for KaiHelper {
                     }
                     if name.starts_with(file_prefix) {
                         let is_dir = entry.path().is_dir();
-                        let suffix = if is_dir { "/" } else { " " };
+                        let suffix = if is_dir { "/" } else { "" };
                         let full_token = format!("@{dir_prefix}{name}{suffix}");
                         let display_label = format!("{}{}", name, if is_dir { "/" } else { "" });
                         matches.push(Pair {
@@ -236,10 +236,11 @@ impl Hinter for KaiHelper {
             return None;
         }
 
-        if line.starts_with('/') && !line.contains(' ') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('/') && !trimmed.contains(' ') {
             for (cmd, _) in &self.commands {
-                if cmd.starts_with(line) && *cmd != line {
-                    return Some(cmd[line.len()..].to_string());
+                if cmd.starts_with(trimmed) && *cmd != trimmed {
+                    return Some(cmd[trimmed.len()..].to_string());
                 }
             }
         }
@@ -247,7 +248,11 @@ impl Hinter for KaiHelper {
     }
 }
 
-impl Highlighter for KaiHelper {}
+impl Highlighter for KaiHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        std::borrow::Cow::Owned(format!("\x1b[2m\x1b[90m{hint}\x1b[0m"))
+    }
+}
 impl Validator for KaiHelper {}
 impl Helper for KaiHelper {}
 
@@ -266,7 +271,7 @@ mod tests {
         let (idx, candidates) = helper.complete("/m", 2, &ctx).unwrap();
         assert_eq!(idx, 0);
         assert!(!candidates.is_empty());
-        assert_eq!(candidates[0].replacement, "/model ");
+        assert_eq!(candidates[0].replacement, "/model");
     }
 
     #[test]

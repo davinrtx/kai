@@ -250,8 +250,17 @@ pub fn parse_openai_models_json(
                 continue;
             }
 
-            let owned_by = m
-                .get("owned_by")
+            // Exclude models that declare supported_parameters but lack tool use capability
+            if let Some(params) = m.get("supported_parameters").and_then(|p| p.as_array()) {
+                let has_tools = params.iter().any(|param| param.as_str() == Some("tools"));
+                if !has_tools {
+                    continue;
+                }
+            }
+
+            let description = m
+                .get("name")
+                .or_else(|| m.get("owned_by"))
                 .and_then(|o| o.as_str())
                 .map(|s| s.to_string());
 
@@ -259,7 +268,7 @@ pub fn parse_openai_models_json(
                 id: id.to_string(),
                 provider: provider.to_string(),
                 endpoint: chat_endpoint.to_string(),
-                description: owned_by,
+                description,
             });
         }
     }
@@ -268,7 +277,10 @@ pub fn parse_openai_models_json(
 }
 
 /// Probes an Ollama endpoint via native `GET /api/tags`.
-pub async fn probe_ollama(client: &reqwest::Client, base_url: &str) -> Option<Vec<DiscoveredModel>> {
+pub async fn probe_ollama(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Option<Vec<DiscoveredModel>> {
     let root = strip_endpoint_suffixes(base_url);
     let tags_url = format!("{root}/api/tags");
 
@@ -326,14 +338,29 @@ pub async fn probe_openai_compatible(
     base_url: &str,
     api_key: Option<&str>,
 ) -> Option<(Vec<DiscoveredModel>, String)> {
+    let clean_base = base_url.trim().trim_end_matches('/');
     let root = strip_endpoint_suffixes(base_url);
 
-    // Build candidate paths in order of likelihood
-    let candidates = vec![
-        (format!("{root}/v1/models"), format!("{root}/v1")),
-        (format!("{root}/models"), root.clone()),
-        (format!("{base_url}/models"), base_url.to_string()),
-    ];
+    // Build candidate paths in prioritized sequence
+    let mut candidates = Vec::new();
+    // 1. Prioritize direct /models under the configured base URL (e.g. https://openrouter.ai/api/v1/models)
+    candidates.push((format!("{clean_base}/models"), clean_base.to_string()));
+    // 2. If base URL does not end in /v1, try root/v1/models
+    if !clean_base.ends_with("/v1") {
+        candidates.push((format!("{root}/v1/models"), format!("{root}/v1")));
+    }
+    // 3. Fallback to root/models
+    if format!("{root}/models") != format!("{clean_base}/models") {
+        candidates.push((format!("{root}/models"), root.clone()));
+    }
+
+    let is_remote = base_url.starts_with("https://")
+        || (!base_url.contains("localhost") && !base_url.contains("127.0.0.1"));
+    let timeout = if is_remote {
+        std::time::Duration::from_millis(5000)
+    } else {
+        PROBE_TIMEOUT
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -349,13 +376,14 @@ pub async fn probe_openai_compatible(
         if let Ok(resp) = client
             .get(&probe_url)
             .headers(headers.clone())
-            .timeout(PROBE_TIMEOUT)
+            .timeout(timeout)
             .send()
             .await
         {
             if resp.status().is_success() {
                 if let Ok(json) = resp.json::<Value>().await {
-                    let models = parse_openai_models_json(&json, &chat_endpoint, "openai-compatible");
+                    let models =
+                        parse_openai_models_json(&json, &chat_endpoint, "openai-compatible");
                     if !models.is_empty() {
                         return Some((models, chat_endpoint));
                     }
@@ -421,7 +449,10 @@ pub async fn discover_all_local_models(
     }
 
     for &(_name, default_url) in DEFAULT_LOCAL_ENDPOINTS {
-        if !endpoints_to_probe.iter().any(|u| u.starts_with(default_url)) {
+        if !endpoints_to_probe
+            .iter()
+            .any(|u| u.starts_with(default_url))
+        {
             endpoints_to_probe.push(default_url.to_string());
         }
     }

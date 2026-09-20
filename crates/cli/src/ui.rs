@@ -5,7 +5,7 @@
 //! Automatically enables Windows Virtual Terminal Processing or gracefully disables
 //! ANSI codes to prevent escape sequence artifacts (`←[1m`).
 
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,8 +14,134 @@ use serde_json::Value;
 
 static COLOR_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Global OS signal subsystem providing reliable, non-terminating Ctrl+C cancellation.
+pub mod signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+    use tokio::sync::broadcast;
+
+    static NOTIFY_TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
+    static WAS_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(windows)]
+    mod win {
+        use super::*;
+        type BOOL = i32;
+        type DWORD = u32;
+
+        const STD_INPUT_HANDLE: DWORD = -10i32 as DWORD;
+        const ENABLE_PROCESSED_INPUT: DWORD = 0x0001;
+
+        extern "system" {
+            fn GetStdHandle(nStdHandle: DWORD) -> *mut std::ffi::c_void;
+            fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut DWORD) -> BOOL;
+            fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: DWORD) -> BOOL;
+            fn SetConsoleCtrlHandler(
+                HandlerRoutine: Option<unsafe extern "system" fn(DWORD) -> BOOL>,
+                Add: BOOL,
+            ) -> BOOL;
+        }
+
+        // Safety Invariant:
+        // C-FFI callback invoked by Windows on a dedicated OS thread upon receiving console events.
+        // Returning 1 marks the event handled, preventing process termination.
+        unsafe extern "system" fn raw_ctrl_handler(ctrl_type: DWORD) -> BOOL {
+            const CTRL_C_EVENT: DWORD = 0;
+            const CTRL_BREAK_EVENT: DWORD = 1;
+            if ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_BREAK_EVENT {
+                WAS_CANCELLED.store(true, Ordering::SeqCst);
+                if let Some(tx) = NOTIFY_TX.get() {
+                    let _ = tx.send(());
+                }
+                1
+            } else {
+                0
+            }
+        }
+
+        /// Registers OS-level console control handler and ensures processed input is enabled.
+        pub fn init_win_handler() {
+            // Safety Invariant: Calls standard Win32 API with valid function pointer.
+            unsafe {
+                SetConsoleCtrlHandler(Some(raw_ctrl_handler), 1);
+                ensure_input_mode();
+            }
+        }
+
+        /// Configures standard input to ensure CTRL_C_EVENT is dispatched to handlers.
+        pub fn ensure_input_mode() {
+            // Safety Invariant: Calls Win32 GetStdHandle and SetConsoleMode with valid stack pointer.
+            unsafe {
+                let h_in = GetStdHandle(STD_INPUT_HANDLE);
+                if !h_in.is_null() && h_in != (-1isize as *mut std::ffi::c_void) {
+                    let mut mode: DWORD = 0;
+                    if GetConsoleMode(h_in, &mut mode) != 0 {
+                        SetConsoleMode(h_in, mode | ENABLE_PROCESSED_INPUT);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Initializes signal handling and registers OS-level console control handlers.
+    pub fn init_signals() {
+        let (tx, _) = broadcast::channel(16);
+        let _ = NOTIFY_TX.set(tx.clone());
+
+        #[cfg(windows)]
+        {
+            win::init_win_handler();
+        }
+
+        #[cfg(not(windows))]
+        {
+            tokio::spawn(async move {
+                while let Ok(()) = tokio::signal::ctrl_c().await {
+                    WAS_CANCELLED.store(true, Ordering::SeqCst);
+                    let _ = tx.send(());
+                }
+            });
+        }
+    }
+
+    /// Ensures that console input processing mode is enabled so Ctrl+C events are dispatched.
+    pub fn ensure_console_mode() {
+        #[cfg(windows)]
+        {
+            win::ensure_input_mode();
+        }
+    }
+
+    /// Subscribes to cancellation signal events.
+    pub fn subscribe() -> broadcast::Receiver<()> {
+        if let Some(tx) = NOTIFY_TX.get() {
+            tx.subscribe()
+        } else {
+            init_signals();
+            if let Some(tx) = NOTIFY_TX.get() {
+                tx.subscribe()
+            } else {
+                let (_, rx) = broadcast::channel(1);
+                rx
+            }
+        }
+    }
+
+    /// Returns whether a cancellation signal was received.
+    pub fn was_cancelled() -> bool {
+        WAS_CANCELLED.load(Ordering::SeqCst)
+    }
+
+    /// Resets the cancellation flag.
+    pub fn reset() {
+        WAS_CANCELLED.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Initializes console subsystem and enables Virtual Terminal Processing if supported.
 pub fn init_terminal() {
+    signal::init_signals();
+
     if std::env::var_os("NO_COLOR").is_some() {
         COLOR_ENABLED.store(false, Ordering::SeqCst);
         return;
@@ -35,6 +161,14 @@ pub fn init_terminal() {
             fn GetStdHandle(nStdHandle: DWORD) -> HANDLE;
             fn GetConsoleMode(hConsoleHandle: HANDLE, lpMode: *mut DWORD) -> BOOL;
             fn SetConsoleMode(hConsoleHandle: HANDLE, dwMode: DWORD) -> BOOL;
+            fn SetConsoleOutputCP(wCodePageID: u32) -> BOOL;
+            fn SetConsoleCP(wCodePageID: u32) -> BOOL;
+        }
+
+        // SAFETY: C-FFI call to configure Windows console for UTF-8 (65001) input and output.
+        unsafe {
+            SetConsoleOutputCP(65001);
+            SetConsoleCP(65001);
         }
 
         // Safety Invariant:
@@ -187,53 +321,71 @@ pub fn visible_width(s: &str) -> usize {
 }
 
 /// Returns the active terminal width, bounded between 40 and 120 columns.
+#[cfg(windows)]
+mod win_console {
+    pub type HANDLE = *mut std::ffi::c_void;
+    pub type BOOL = i32;
+    pub type SHORT = i16;
+    pub const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+
+    #[repr(C)]
+    pub struct COORD {
+        pub x: SHORT,
+        pub y: SHORT,
+    }
+
+    #[repr(C)]
+    pub struct SMALL_RECT {
+        pub left: SHORT,
+        pub top: SHORT,
+        pub right: SHORT,
+        pub bottom: SHORT,
+    }
+
+    #[repr(C)]
+    pub struct CONSOLE_SCREEN_BUFFER_INFO {
+        pub dw_size: COORD,
+        pub dw_cursor_position: COORD,
+        pub w_attributes: u16,
+        pub sr_window: SMALL_RECT,
+        pub dw_maximum_window_size: COORD,
+    }
+
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> HANDLE;
+        fn GetConsoleScreenBufferInfo(
+            hConsoleOutput: HANDLE,
+            lpConsoleScreenBufferInfo: *mut CONSOLE_SCREEN_BUFFER_INFO,
+        ) -> BOOL;
+    }
+
+    /// Query the console screen buffer info safely.
+    pub fn get_buffer_info() -> Option<CONSOLE_SCREEN_BUFFER_INFO> {
+        // SAFETY: GetStdHandle is a standard Win32 C-FFI call called with constant STD_OUTPUT_HANDLE.
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        if handle.is_null() || handle == (-1isize as HANDLE) {
+            return None;
+        }
+        let mut info = std::mem::MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::uninit();
+        // SAFETY: GetConsoleScreenBufferInfo receives a valid handle and a pointer to uninitialized memory
+        // allocated on the stack to be filled by the Windows API.
+        let ok = unsafe { GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()) };
+        if ok != 0 {
+            // SAFETY: The API returned non-zero (success), so the struct is fully initialized.
+            Some(unsafe { info.assume_init() })
+        } else {
+            None
+        }
+    }
+}
+
 pub fn terminal_width() -> usize {
     #[cfg(windows)]
     {
-        type HANDLE = *mut std::ffi::c_void;
-        type BOOL = i32;
-        type SHORT = i16;
-        const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
-
-        #[repr(C)]
-        struct COORD {
-            x: SHORT,
-            y: SHORT,
-        }
-        #[repr(C)]
-        struct SMALL_RECT {
-            left: SHORT,
-            top: SHORT,
-            right: SHORT,
-            bottom: SHORT,
-        }
-        #[repr(C)]
-        struct CONSOLE_SCREEN_BUFFER_INFO {
-            dw_size: COORD,
-            dw_cursor_position: COORD,
-            w_attributes: u16,
-            sr_window: SMALL_RECT,
-            dw_maximum_window_size: COORD,
-        }
-
-        extern "system" {
-            fn GetStdHandle(nStdHandle: u32) -> HANDLE;
-            fn GetConsoleScreenBufferInfo(
-                hConsoleOutput: HANDLE,
-                lpConsoleScreenBufferInfo: *mut CONSOLE_SCREEN_BUFFER_INFO,
-            ) -> BOOL;
-        }
-
-        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
-        if !handle.is_null() && handle != (-1isize as HANDLE) {
-            let mut info = std::mem::MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::uninit();
-            let ok = unsafe { GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()) };
-            if ok != 0 {
-                let info = unsafe { info.assume_init() };
-                let width = (info.sr_window.right - info.sr_window.left + 1) as usize;
-                if width >= 40 {
-                    return width.clamp(40, 120);
-                }
+        if let Some(info) = win_console::get_buffer_info() {
+            let width = (info.sr_window.right - info.sr_window.left + 1) as usize;
+            if width >= 40 {
+                return width.clamp(40, 200);
             }
         }
     }
@@ -241,12 +393,70 @@ pub fn terminal_width() -> usize {
     if let Ok(cols) = std::env::var("COLUMNS") {
         if let Ok(w) = cols.parse::<usize>() {
             if w >= 40 {
-                return w.clamp(40, 120);
+                return w.clamp(40, 200);
             }
         }
     }
 
     80
+}
+
+/// Returns the active terminal height, bounded between 10 and 100 rows.
+pub fn terminal_height() -> usize {
+    #[cfg(windows)]
+    {
+        if let Some(info) = win_console::get_buffer_info() {
+            let height = (info.sr_window.bottom - info.sr_window.top + 1) as usize;
+            if height >= 10 {
+                return height.clamp(10, 100);
+            }
+        }
+    }
+
+    if let Ok(lines) = std::env::var("LINES") {
+        if let Ok(h) = lines.parse::<usize>() {
+            if h >= 10 {
+                return h.clamp(10, 100);
+            }
+        }
+    }
+
+    24
+}
+
+/// Advances vertical space so the prompt area is placed at the bottom of the terminal window.
+pub fn pad_to_bottom(reserved_rows: usize) {
+    #[cfg(windows)]
+    {
+        if let Some(info) = win_console::get_buffer_info() {
+            let window_height = (info.sr_window.bottom - info.sr_window.top + 1) as usize;
+            let cursor_row_in_window =
+                (info.dw_cursor_position.y - info.sr_window.top).max(0) as usize;
+            let target_row = window_height.saturating_sub(reserved_rows);
+            if cursor_row_in_window < target_row {
+                let needed = target_row - cursor_row_in_window;
+                for _ in 0..needed {
+                    println!();
+                }
+            }
+            return;
+        }
+    }
+
+    // Fallback for non-Windows environments
+    let height = terminal_height();
+    let target = height.saturating_sub(reserved_rows);
+    if target > 15 {
+        print!("\x1b[{}B", target);
+        let _ = io::stdout().flush();
+    }
+}
+
+pub fn horizontal_separator() -> String {
+    let width = terminal_width().saturating_sub(2).clamp(40, 160);
+    let d = dim();
+    let r = reset();
+    format!("{d}{}{r}", "─".repeat(width))
 }
 
 /// Splits input text into wrapped lines respecting word boundaries and maximum column bounds.
@@ -352,189 +562,142 @@ pub fn draw_box_panel(
     out
 }
 
-/// Formats a path to display cleanly inside narrow banners.
-fn format_short_path(path: &Path, max_len: usize) -> String {
-    let s = path.to_string_lossy().replace('\\', "/");
-    if s.len() <= max_len {
-        s
-    } else if max_len <= 3 {
-        "...".to_string()
-    } else {
-        format!("...{}", &s[s.len() - (max_len - 3)..])
+/// The 15-line Krill ASCII emblem.
+pub const KRILL_ASCII: [&str; 15] = [
+    "      ▄           ▄▄▄▄▄▄",
+    "    ▄▄██████████▀▀▀▀▀▀▀▀",
+    "     ▀▀▀▀▀▀▀▀█▄█████████",
+    "        ▄██▀██▀███████▀█",
+    "    ▄███▄█████████████▀▀",
+    "    ███████████████▀▀",
+    "   ▄████████▄▀▀▀▀",
+    "  ▄█▄███████▄█▄▄",
+    "  █████▄█▀▀██▄▀██▄",
+    "  ▀███████▄█▄▀█▄▀▀",
+    "   ▄███▀██    ▀█",
+    "    ██████▄",
+    "      ▀████▄▄▄      ▄▄▄▄",
+    "           ▀███▀▄▄▄▄▄▄██",
+    "               ▀▀▀▀▀▀▀▀▀",
+];
+
+/// Formats a path relative to the user's home directory with `~/` prefix.
+pub fn format_home_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    // Strip Windows verbatim UNC prefix `\\?\` if present
+    let clean = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let clean_slash = clean.replace('\\', "/");
+
+    if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+        let home_clean = home.replace('\\', "/");
+        if clean_slash.starts_with(&home_clean) {
+            let rel = &clean_slash[home_clean.len()..];
+            let rel_trimmed = rel.trim_start_matches('/');
+            return format!("~/{rel_trimmed}");
+        }
     }
+    clean_slash
 }
 
-/// Prints the stylized KAI welcome banner with a two-column grid.
+/// Prints the modern borderless KAI welcome banner with Krill ASCII art and adjacent metadata.
 pub fn print_banner(
     version: &str,
     model: &str,
-    base_url: &str,
+    _base_url: &str,
     working_dir: &Path,
-    session_id: &str,
+    _session_id: &str,
     tool_names: &[String],
     skills_count: usize,
 ) {
-    let width = terminal_width().clamp(72, 110);
-    let border = yellow();
-    let accent = cyan();
+    let width = terminal_width();
+    let c = cyan();
+    let b = bold();
     let d = dim();
     let r = reset();
-    let b = bold();
+    let g = green();
     let rd = red();
 
-    let title = format!("KAI (Krill Agent Interface) v{version}");
+    let user_str = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "kai-user".to_string());
+
     let is_unconfigured = model == crate::config::UNCONFIGURED_MODEL || model.is_empty();
+    let model_line = if is_unconfigured {
+        format!("{b}{rd}no model configured{r} {d}(run /model){r}")
+    } else {
+        format!("{g}{model}{r} {d}(Ready){r}")
+    };
 
-    if width >= 72 {
-        // Two-column layout
-        let left_col = 32;
-        let left_inner_box = left_col + 4;
-        let right_inner_box = width.saturating_sub(3 + left_inner_box);
-        let right_col = right_inner_box.saturating_sub(4);
+    let meta_lines = [
+        format!("{b}{c}KAI CLI {version}{r}"),
+        format!("{d}{user_str} (Autonomous Agent){r}"),
+        model_line,
+        format!("{d}{}{r}", format_home_path(working_dir)),
+        format!(
+            "{d}{} tools · {} skills · type ? for shortcuts{r}",
+            tool_names.len(),
+            skills_count
+        ),
+    ];
 
-        // Left hero emblem
-        let hero_art = [
-            "          /\\",
-            "         /  \\",
-            "        / /\\ \\",
-            "       / / ◈\\ \\",
-            "       \\ \\   / /",
-            "        \\ \\ / /",
-            "         \\ V /",
-        ];
-
-        let short_dir = format_short_path(working_dir, 22);
-        let short_sess = if session_id.len() > 22 {
-            format!("{}...", &session_id[..19])
-        } else {
-            session_id.to_string()
-        };
-
-        let mut left_lines = Vec::new();
-        for art in hero_art {
-            left_lines.push(format!("{art:<left_col$}"));
-        }
-        left_lines.push(String::new());
-
-        if is_unconfigured {
-            left_lines.push(format!("{d}Model:{r} {b}{rd}no model configured{r}"));
-            left_lines.push(format!("{d}Hint:{r}  {d}run /model to set{r}"));
-        } else {
-            let short_model = if model.len() > 22 {
-                format!("{}...", &model[..19])
+    println!();
+    if width >= 65 {
+        for (i, art_line) in KRILL_ASCII.iter().enumerate() {
+            let meta = if i < meta_lines.len() {
+                &meta_lines[i]
             } else {
-                model.to_string()
+                ""
             };
-            left_lines.push(format!("{d}Model:{r} {b}{short_model}{r}"));
-            left_lines.push(format!(
-                "{d}Host:{r}  {}",
-                format_short_path(Path::new(base_url), 22)
-            ));
-        }
-        left_lines.push(format!("{d}Dir:{r}   {short_dir}"));
-        left_lines.push(format!("{d}Sess:{r}  {short_sess}"));
-
-        // Right column: tools, skills, summary
-        let mut right_lines = Vec::new();
-        right_lines.push(format!("{b}{accent}Available Tools{r}"));
-
-        let mut fs_tools = Vec::new();
-        let mut exec_tools = Vec::new();
-        let mut agent_tools = Vec::new();
-        let mut other_tools = Vec::new();
-
-        for name in tool_names {
-            match name.as_str() {
-                "read_window" | "apply_patch" => fs_tools.push(name.as_str()),
-                "exec_command" => exec_tools.push(name.as_str()),
-                "delegate_task" | "clarify" => agent_tools.push(name.as_str()),
-                _ => other_tools.push(name.as_str()),
+            if meta.is_empty() {
+                println!("  {c}{art_line}{r}");
+            } else {
+                println!("  {c}{art_line:<26}{r}    {meta}");
             }
         }
-
-        if !fs_tools.is_empty() {
-            right_lines.push(format!("{d}fs:{r}     {}", fs_tools.join(", ")));
-        }
-        if !exec_tools.is_empty() {
-            right_lines.push(format!("{d}exec:{r}   {}", exec_tools.join(", ")));
-        }
-        if !agent_tools.is_empty() {
-            right_lines.push(format!("{d}agent:{r}  {}", agent_tools.join(", ")));
-        }
-        if !other_tools.is_empty() {
-            right_lines.push(format!("{d}core:{r}   {}", other_tools.join(", ")));
-        }
-
-        right_lines.push(String::new());
-        right_lines.push(format!("{b}{accent}Available Skills{r}"));
-        if skills_count > 0 {
-            right_lines.push(format!("{d}catalog:{r} {skills_count} procedural skill(s)"));
-        } else {
-            right_lines.push(format!("{d}catalog:{r} 0 procedural skills"));
-        }
-
-        right_lines.push(String::new());
-        right_lines.push(format!(
-            "{d}{} tools · {} skills · /help for commands{r}",
-            tool_names.len(),
-            skills_count
-        ));
-
-        // Equalize line counts
-        let max_rows = left_lines.len().max(right_lines.len());
-        while left_lines.len() < max_rows {
-            left_lines.push(String::new());
-        }
-        while right_lines.len() < max_rows {
-            right_lines.push(String::new());
-        }
-
-        // Render combined box
-        let title_fmt = format!(" {title} ");
-        let title_len = visible_width(&title) + 2;
-        let right_dashes = width.saturating_sub(3 + title_len);
-        println!(
-            "{border}╭─{r}{b}{accent}{title_fmt}{r}{border}{}╮{r}",
-            "─".repeat(right_dashes)
-        );
-
-        for i in 0..max_rows {
-            let left = &left_lines[i];
-            let right = &right_lines[i];
-
-            let left_vis = visible_width(left);
-            let right_vis = visible_width(right);
-
-            let left_pad = " ".repeat(left_col.saturating_sub(left_vis));
-            let right_pad = " ".repeat(right_col.saturating_sub(right_vis));
-
-            println!(
-                "{border}│{r}  {left}{left_pad}  {border}│{r}  {right}{right_pad}  {border}│{r}"
-            );
-        }
-
-        let bot_left = "─".repeat(left_inner_box);
-        let bot_right = "─".repeat(right_inner_box);
-        println!("{border}╰{bot_left}┴{bot_right}╯{r}\n");
     } else {
-        // Narrow terminal stacked layout
-        let mut lines = Vec::new();
-        if is_unconfigured {
-            lines.push(format!("{b}{rd}no model configured{r} {d}— run /model{r}"));
-        } else {
-            lines.push(format!("{b}Model:{r} {model}"));
-            lines.push(format!("{d}Endpoint:{r} {base_url}"));
+        for art_line in KRILL_ASCII.iter() {
+            println!("  {c}{art_line}{r}");
         }
-        lines.push(format!("{d}Working Dir:{r} {}", working_dir.display()));
-        lines.push(format!(
-            "{d}Tools: {}{r} | {d}Skills: {}{r}",
-            tool_names.len(),
-            skills_count
-        ));
-        lines.push(format!("{d}Type '/help' for command manual{r}"));
+        println!();
+        for meta in &meta_lines {
+            println!("  {meta}");
+        }
+    }
+    println!();
+}
 
-        let panel = draw_box_panel(&title, &lines, width, border, accent);
-        println!("{panel}\n");
+/// Prints the status footer line below the prompt divider matching the reference layout:
+/// `? for shortcuts                                  accept-edits · Gemini 1.5 Flash · high`
+pub fn print_prompt_footer(model: &str, git_branch: Option<&str>, auto_approve: bool) {
+    let d = dim();
+    let r = reset();
+    let g = green();
+    let c = cyan();
+
+    let left = format!("{d}? for shortcuts{r}");
+    let left_len = 15; // "? for shortcuts"
+
+    let mode_str = if auto_approve {
+        "accept-edits"
+    } else {
+        "confirm-edits"
+    };
+    let model_str = if model.is_empty() || model == crate::config::UNCONFIGURED_MODEL {
+        "no-model"
+    } else {
+        model
+    };
+    let branch_str = git_branch.unwrap_or("main");
+
+    let right = format!("{g}{mode_str}{r} {d}·{r} {c}{model_str}{r} {d}·{r} {g}{branch_str}{r}");
+    let right_len = mode_str.len() + 3 + model_str.len() + 3 + branch_str.len();
+
+    let width = terminal_width().saturating_sub(2).clamp(50, 160);
+    if width > left_len + right_len + 4 {
+        let spaces = width.saturating_sub(left_len + right_len);
+        println!("{left}{}{right}", " ".repeat(spaces));
+    } else {
+        println!("{left}  {right}");
     }
 }
 
@@ -660,7 +823,7 @@ pub fn print_status_bar(
     };
 
     println!(
-        "\n  {model_display} {d}·{r} {y}{token_str} tokens{r} {d}·{r} {g}⎇ {git_display}{r} {d}·{r} {m}{session_branch}{r} {d}·{r} {c}[Ready]{r}"
+        "  {model_display} {d}·{r} {y}{token_str} tokens{r} {d}·{r} {g}⎇ {git_display}{r} {d}·{r} {m}{session_branch}{r} {d}·{r} {c}[Ready]{r}"
     );
 }
 
@@ -794,6 +957,68 @@ pub fn print_info(msg: &str) {
     println!("{b}{c}Info:{r} {msg}");
 }
 
+/// Lightweight RAII spinner providing live animated feedback while waiting for inference.
+pub struct Spinner {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Spinner {
+    /// Starts an asynchronous spinner animation on the current line if stdout is a terminal.
+    pub fn start(message: impl Into<String>) -> Self {
+        if !is_color_enabled() || !io::stdout().is_terminal() {
+            return Self { stop_tx: None };
+        }
+
+        let msg = message.into();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            const FRAMES: &[&str] = &["-", "\\", "|", "/"];
+            let mut i = 0;
+            let start = std::time::Instant::now();
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+
+            let c = cyan();
+            let d = dim();
+            let r = reset();
+
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => {
+                        print!("\r                                                                                \r");
+                        let _ = io::stdout().flush();
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        let elapsed = start.elapsed().as_secs();
+                        let frame = FRAMES[i % FRAMES.len()];
+                        i += 1;
+                        print!("\r  {c}{frame}{r} {d}{msg}... ({elapsed}s){r}   ");
+                        let _ = io::stdout().flush();
+                    }
+                }
+            }
+        });
+
+        Self {
+            stop_tx: Some(stop_tx),
+        }
+    }
+
+    /// Stops the spinner and clears the terminal line.
+    pub fn stop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Interactive CLI approval policy for evaluating tool execution authorization.
 pub struct CliApprovalPolicy {
     auto_approve: bool,
@@ -907,5 +1132,11 @@ mod tests {
         assert_eq!(visible_width("hello world"), 11);
         assert_eq!(visible_width("\x1b[1m\x1b[31mno model\x1b[0m"), 8);
         assert_eq!(visible_width("\x1b[32m⎇ feat/cli\x1b[0m"), 10);
+    }
+
+    #[tokio::test]
+    async fn test_spinner_lifecycle() {
+        let mut spinner = Spinner::start("Test loading");
+        spinner.stop();
     }
 }

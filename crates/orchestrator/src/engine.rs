@@ -12,7 +12,8 @@ use kai_core::error::{KaiError, OrchestratorError, Result};
 use kai_core::event::{Event, EventBus, GlobalSteeringReceiver};
 use kai_core::message::{Message, ToolResult};
 use kai_core::traits::{
-    Agent, ApprovalDecision, StepOutcome, Tool, ToolApprovalPolicy, ToolContext,
+    Agent, ApprovalDecision, CommandOutputCompressor, StepOutcome, Tool, ToolApprovalPolicy,
+    ToolContext,
 };
 use kai_core::ToolResultCache;
 use tokio::sync::Mutex;
@@ -41,6 +42,7 @@ pub struct OrchestrationEngine {
     tool_failure_counts: HashMap<String, usize>,
     approval_policy: Option<Arc<dyn ToolApprovalPolicy>>,
     tool_cache: Option<Arc<ToolResultCache>>,
+    compressor: Option<Arc<dyn CommandOutputCompressor>>,
 }
 
 impl OrchestrationEngine {
@@ -65,6 +67,7 @@ impl OrchestrationEngine {
             tool_failure_counts: HashMap::new(),
             approval_policy: None,
             tool_cache: None,
+            compressor: None,
         }
     }
 
@@ -83,6 +86,12 @@ impl OrchestrationEngine {
     /// Attaches a [`ToolResultCache`] for deterministic read-only tool memoization.
     pub fn with_tool_cache(mut self, cache: Arc<ToolResultCache>) -> Self {
         self.tool_cache = Some(cache);
+        self
+    }
+
+    /// Configures a [`CommandOutputCompressor`] for pruning boilerplate from tool execution outputs.
+    pub fn with_compressor(mut self, compressor: Arc<dyn CommandOutputCompressor>) -> Self {
+        self.compressor = Some(compressor);
         self
     }
 
@@ -125,6 +134,9 @@ impl OrchestrationEngine {
         let mut ctx = ToolContext::new(&self.working_dir, &self.session_id, agent_id);
         if let Some(st) = &self.steering {
             ctx = ctx.with_steering(st.clone());
+        }
+        if let Some(comp) = &self.compressor {
+            ctx = ctx.with_compressor(comp.clone());
         }
         ctx
     }

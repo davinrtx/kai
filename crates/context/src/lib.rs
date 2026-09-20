@@ -7,6 +7,7 @@
 //! components implementing [`kai_core::ContextProcessor`].
 
 pub mod ast;
+pub mod compressor;
 pub mod grep;
 pub mod lsp;
 pub mod processor;
@@ -15,6 +16,7 @@ pub mod wasm_grammar;
 pub mod window;
 
 pub use ast::AstSkeleton;
+pub use compressor::SemanticCommandCompressor;
 pub use grep::{
     GrepMatch, GrepOptions, GrepResults, GrepSearcher, DEFAULT_MAX_FILE_SIZE_BYTES,
     DEFAULT_MAX_SEARCH_HORIZON,

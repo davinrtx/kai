@@ -10,8 +10,9 @@ use std::time::Duration;
 use kai_core::event::{global_steering_channel, SteeringState};
 use kai_core::traits::{Tool, ToolContext};
 use kai_tools::{
-    default_tools, ApplyPatchTool, BrowserActionTool, ExecCommandTool, McpClient, McpClientTool,
-    McpToolDefinition, MockBrowserDriver, MockMcpTransport, ReadWindowTool, MAX_WINDOW_LIMIT,
+    default_tools, ApplyPatchTool, BrowserActionTool, ExecCommandTool, ListDirTool, McpClient,
+    McpClientTool, McpToolDefinition, MockBrowserDriver, MockMcpTransport, ReadWindowTool,
+    MAX_WINDOW_LIMIT,
 };
 use serde_json::json;
 
@@ -407,7 +408,7 @@ async fn test_mcp_client_tool_discovery_and_call() {
 #[test]
 fn test_default_tools_enumeration() {
     let registry = default_tools();
-    assert_eq!(registry.len(), 6);
+    assert_eq!(registry.len(), 7);
 }
 
 #[tokio::test]
@@ -743,4 +744,116 @@ fn test_skill_registry_yaml_crlf_and_comments() {
     assert_eq!(skill.triggers, vec!["squash", "rebase"]);
     assert!(skill.instructions.contains("Execute git rebase -i HEAD~N"));
     assert!(skill.matches_query("Please squash these commits"));
+}
+
+#[tokio::test]
+async fn test_list_dir_bounded_and_formatted() {
+    let temp_dir = std::env::temp_dir().join(format!("kai_test_list_dir_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    // Create subdirectories and files
+    fs::create_dir_all(temp_dir.join("subdir_b")).unwrap();
+    fs::create_dir_all(temp_dir.join("subdir_a")).unwrap();
+    fs::write(temp_dir.join("file_z.txt"), "hello").unwrap();
+    fs::write(temp_dir.join("file_a.txt"), "world 12345").unwrap();
+
+    let tool = ListDirTool::new();
+    let ctx = ToolContext::new(&temp_dir, "sess_ld_1", "agent_ld");
+
+    let args = json!({
+        "path": "."
+    });
+    let res = tool.execute(args, &ctx).await.unwrap();
+    assert!(!res.is_error);
+
+    // Verify subdirectories appear first, sorted alphabetically
+    let output = res.output;
+    assert!(output.contains("[DIR]  subdir_a/"));
+    assert!(output.contains("[DIR]  subdir_b/"));
+    assert!(output.contains("[FILE] file_a.txt (11 bytes)"));
+    assert!(output.contains("[FILE] file_z.txt (5 bytes)"));
+
+    let dir_a_idx = output.find("[DIR]  subdir_a/").unwrap();
+    let dir_b_idx = output.find("[DIR]  subdir_b/").unwrap();
+    let file_a_idx = output.find("[FILE] file_a.txt").unwrap();
+    let file_z_idx = output.find("[FILE] file_z.txt").unwrap();
+
+    assert!(dir_a_idx < dir_b_idx);
+    assert!(dir_b_idx < file_a_idx);
+    assert!(file_a_idx < file_z_idx);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_list_dir_file_as_dir_and_nonexistent() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kai_test_list_dir_err_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let dummy_file = temp_dir.join("single_file.txt");
+    fs::write(&dummy_file, "content").unwrap();
+
+    let tool = ListDirTool::new();
+    let ctx = ToolContext::new(&temp_dir, "sess_ld_err", "agent_ld");
+
+    // 1. Path is a file, not directory
+    let file_args = json!({
+        "path": "single_file.txt"
+    });
+    let res = tool.execute(file_args, &ctx).await.unwrap();
+    assert!(res.is_error);
+    assert!(res.output.contains("Path is a file, not a directory"));
+
+    // 2. Path does not exist
+    let non_exist_args = json!({
+        "path": "does_not_exist_folder"
+    });
+    let res2 = tool.execute(non_exist_args, &ctx).await.unwrap();
+    assert!(res2.is_error);
+    assert!(res2.output.contains("Directory not found"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_list_dir_pagination_and_truncation() {
+    let temp_dir =
+        std::env::temp_dir().join(format!("kai_test_list_dir_page_{}", std::process::id()));
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    for i in 0..15 {
+        fs::write(temp_dir.join(format!("file_{:02}.txt", i)), "data").unwrap();
+    }
+
+    let tool = ListDirTool::new();
+    let ctx = ToolContext::new(&temp_dir, "sess_ld_page", "agent_ld");
+
+    // Page 1: offset 0, limit 5
+    let page1_args = json!({
+        "offset": 0,
+        "limit": 5
+    });
+    let res1 = tool.execute(page1_args, &ctx).await.unwrap();
+    assert!(!res1.is_error);
+    assert!(res1.output.contains("showing entries 1-5 of 15"));
+    assert!(res1.output.contains("file_00.txt"));
+    assert!(res1.output.contains("file_04.txt"));
+    assert!(!res1.output.contains("file_05.txt"));
+    assert!(res1.output.contains("[Truncated: 10 remaining items"));
+
+    // Page 2: offset 5, limit 5
+    let page2_args = json!({
+        "offset": 5,
+        "limit": 5
+    });
+    let res2 = tool.execute(page2_args, &ctx).await.unwrap();
+    assert!(!res2.is_error);
+    assert!(res2.output.contains("showing entries 6-10 of 15"));
+    assert!(res2.output.contains("file_05.txt"));
+    assert!(res2.output.contains("file_09.txt"));
+    assert!(!res2.output.contains("file_04.txt"));
+    assert!(res2.output.contains("[Truncated: 5 remaining items"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

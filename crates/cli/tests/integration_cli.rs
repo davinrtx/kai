@@ -12,8 +12,7 @@ use kai_cli::config::KaiConfig;
 use kai_cli::error::Result;
 use kai_cli::LlmAgent;
 use kai_core::message::{Message, ToolCall, ToolResult};
-use kai_core::traits::{BoxFuture, Tool};
-use kai_core::ToolResultCache;
+use kai_core::{BoxFuture, Tool, ToolResultCache};
 use kai_orchestrator::engine::OrchestrationEngine;
 use kai_orchestrator::inbox::TaskInbox;
 use kai_tools::ReadWindowTool;
@@ -127,6 +126,40 @@ fn test_config_resolution_defaults_and_overrides() {
 }
 
 #[test]
+fn test_kai_config_file_persistence() {
+    let temp_dir = std::env::temp_dir().join(format!(
+        "kai_cfg_test_{}",
+        kai_core::message::current_timestamp_ms()
+    ));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+
+    let file_cfg = kai_cli::config::KaiConfigFile {
+        base_url: Some("https://openrouter.ai/api/v1".to_string()),
+        model: Some("anthropic/claude-3.5-sonnet".to_string()),
+        api_key: Some("sk-or-test-persisted".to_string()),
+        max_turns: Some(30),
+        auto_approve: Some(true),
+    };
+
+    let path = file_cfg.save(&temp_dir).unwrap();
+    assert!(path.exists());
+
+    let loaded = kai_cli::config::KaiConfigFile::load(&temp_dir).unwrap();
+    assert_eq!(loaded, file_cfg);
+
+    // Verify KaiConfig::resolve loads from file
+    let resolved =
+        KaiConfig::resolve(None, None, None, Some(temp_dir.clone()), None, false).unwrap();
+    assert_eq!(resolved.base_url, "https://openrouter.ai/api/v1");
+    assert_eq!(resolved.model, "anthropic/claude-3.5-sonnet");
+    assert_eq!(resolved.api_key, Some("sk-or-test-persisted".to_string()));
+    assert_eq!(resolved.max_turns, 30);
+    assert!(resolved.auto_approve);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn test_model_client_message_formatting() {
     let msg_user = Message::user("msg_01", "Hello assistant");
     let call = ToolCall::new(
@@ -206,8 +239,8 @@ async fn test_offline_mock_model_client_and_agent_execution() {
         None,
     ));
 
-    let tool = Arc::new(ReadWindowTool::new());
-    let tool_schemas = vec![tool.schema()];
+    let tool: Arc<dyn Tool> = Arc::new(ReadWindowTool::new());
+    let tool_schemas = kai_cli::client::build_tool_schemas(std::slice::from_ref(&tool));
 
     let agent = Arc::new(Mutex::new(
         LlmAgent::new("agent-test", "Test Agent", "System Prompt", client)
@@ -322,10 +355,25 @@ fn test_model_hot_switching() {
     assert_eq!(agent.model(), "gpt-4o");
     assert_eq!(agent.base_url(), "https://api.openai.com/v1");
 
+    // Dynamic API key switching
+    assert!(agent.api_key().is_none());
+    agent.set_api_key(Some("sk-test-runtime-key".to_string()));
+    assert_eq!(agent.api_key(), Some("sk-test-runtime-key"));
+    agent.set_api_key(None);
+    assert!(agent.api_key().is_none());
+
     // Reasoning state toggles
     assert!(!agent.show_reasoning());
     agent.set_show_reasoning(true);
     assert!(agent.show_reasoning());
+}
+
+#[test]
+fn test_config_multi_provider_env_keys() {
+    std::env::set_var("OPENROUTER_API_KEY", "sk-or-test-provider-mock");
+    let cfg = KaiConfig::resolve(None, None, None, Some(PathBuf::from(".")), None, false).unwrap();
+    assert_eq!(cfg.api_key, Some("sk-or-test-provider-mock".to_string()));
+    std::env::remove_var("OPENROUTER_API_KEY");
 }
 
 #[test]
@@ -665,4 +713,178 @@ async fn test_discovery_cache_positive_and_negative() {
     cache.clear().await;
     assert!(!cache.is_negatively_cached(dead_url).await);
     assert!(cache.get(url).await.is_none());
+}
+
+#[test]
+fn test_sanitize_api_key_variations() {
+    use kai_cli::commands::chat::sanitize_api_key;
+
+    assert_eq!(
+        sanitize_api_key("sk-or-v1-2b2803d8"),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(
+        sanitize_api_key("/key sk-or-v1-2b2803d8"),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(
+        sanitize_api_key("/apikey sk-or-v1-2b2803d8"),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(
+        sanitize_api_key("/key:sk-or-v1-2b2803d8"),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(
+        sanitize_api_key("/key=sk-or-v1-2b2803d8"),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(
+        sanitize_api_key("Bearer sk-or-v1-2b2803d8"),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(
+        sanitize_api_key("\"sk-or-v1-2b2803d8\""),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(
+        sanitize_api_key("'/key sk-or-v1-2b2803d8'"),
+        Some("sk-or-v1-2b2803d8".to_string())
+    );
+    assert_eq!(sanitize_api_key(""), None);
+    assert_eq!(sanitize_api_key("   "), None);
+    assert_eq!(sanitize_api_key("/key"), None);
+    assert_eq!(sanitize_api_key("/apikey"), None);
+}
+
+#[test]
+fn test_parse_openrouter_models_json_with_name() {
+    use kai_cli::discovery::parse_openai_models_json;
+
+    let payload = json!({
+        "data": [
+            {
+                "id": "anthropic/claude-3.5-sonnet",
+                "name": "Anthropic: Claude 3.5 Sonnet",
+                "description": "State of the art reasoning and coding model"
+            },
+            {
+                "id": "text-embedding-ada-002",
+                "name": "Embedding Model"
+            }
+        ]
+    });
+
+    let models = parse_openai_models_json(&payload, "https://openrouter.ai/api/v1", "openrouter");
+    assert_eq!(models.len(), 1); // embedding model excluded
+    assert_eq!(models[0].id, "anthropic/claude-3.5-sonnet");
+    assert_eq!(models[0].endpoint, "https://openrouter.ai/api/v1");
+    assert_eq!(
+        models[0].description.as_deref(),
+        Some("Anthropic: Claude 3.5 Sonnet")
+    );
+}
+
+#[test]
+fn test_filter_models_without_tools_support() {
+    use kai_cli::discovery::parse_openai_models_json;
+
+    let payload = json!({
+        "data": [
+            {
+                "id": "qwen/qwen-2.5-coder-32b-instruct",
+                "name": "Qwen 2.5 Coder 32B",
+                "supported_parameters": ["temperature", "max_tokens"]
+            },
+            {
+                "id": "deepseek/deepseek-chat",
+                "name": "DeepSeek V3",
+                "supported_parameters": ["temperature", "tools", "max_tokens"]
+            },
+            {
+                "id": "unspecified/model-without-params",
+                "name": "Legacy model"
+            }
+        ]
+    });
+
+    let models = parse_openai_models_json(&payload, "https://openrouter.ai/api/v1", "openrouter");
+    // qwen is excluded because supported_parameters does not contain "tools"
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].id, "deepseek/deepseek-chat");
+    assert_eq!(models[1].id, "unspecified/model-without-params");
+}
+
+#[test]
+fn test_format_tools_has_function_name() {
+    use kai_cli::client::{build_tool_schemas, ModelClient};
+
+    let tool: Arc<dyn Tool> = Arc::new(ReadWindowTool::new());
+    let tool_schemas = build_tool_schemas(std::slice::from_ref(&tool));
+    let formatted = ModelClient::format_tools(&tool_schemas);
+
+    assert_eq!(formatted.len(), 1);
+    assert_eq!(formatted[0]["type"], "function");
+    assert_eq!(formatted[0]["function"]["name"], "read_window");
+    assert!(formatted[0]["function"]["description"].is_string());
+    assert!(formatted[0]["function"]["parameters"]["properties"].is_object());
+}
+
+struct FallbackMockTransport {
+    calls: AtomicUsize,
+}
+
+impl LlmTransport for FallbackMockTransport {
+    fn send_request<'a>(
+        &'a self,
+        _url: &'a str,
+        _api_key: Option<&'a str>,
+        payload: &'a Value,
+    ) -> BoxFuture<'a, Result<Value>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if payload.get("tools").is_some() {
+                return Err(kai_cli::error::CliError::Api {
+                    status: 404,
+                    message: "No endpoints found that support tool use".to_string(),
+                });
+            }
+            Ok(json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "Conversational reply without tools"
+                    },
+                    "finish_reason": "stop"
+                }]
+            }))
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_model_client_fallback_when_tools_unsupported() {
+    let transport = Arc::new(FallbackMockTransport {
+        calls: AtomicUsize::new(0),
+    });
+    let client = ModelClient::with_transport(
+        transport.clone(),
+        "https://openrouter.ai/api/v1",
+        "mock-non-tool-model",
+        None,
+    );
+    let tool: Arc<dyn Tool> = Arc::new(ReadWindowTool::new());
+    let tool_schemas = kai_cli::client::build_tool_schemas(std::slice::from_ref(&tool));
+
+    let messages = vec![kai_core::message::Message::user("msg-1", "Hello")];
+    let response = client
+        .complete("System prompt", &messages, &tool_schemas)
+        .await
+        .expect("should fallback and succeed");
+
+    assert_eq!(
+        response.text.as_deref(),
+        Some("Conversational reply without tools")
+    );
+    assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
 }

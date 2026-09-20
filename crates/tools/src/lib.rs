@@ -18,6 +18,7 @@ pub mod apply_patch;
 pub mod browser;
 pub mod cache;
 pub mod exec_command;
+pub mod list_dir;
 pub mod mcp;
 pub mod patcher;
 pub mod read_window;
@@ -33,6 +34,7 @@ pub use exec_command::{
     ExecCommandArgs, ExecCommandTool, ProcessGuard, DEFAULT_COMMAND_TIMEOUT_MS,
     MAX_COMMAND_TIMEOUT_MS, MIN_COMMAND_TIMEOUT_MS,
 };
+pub use list_dir::{ListDirArgs, ListDirTool, DEFAULT_LIST_DIR_LIMIT, MAX_LIST_DIR_LIMIT};
 pub use mcp::{
     McpCallResult, McpClient, McpClientArgs, McpClientTool, McpContent, McpToolDefinition,
     McpTransport, MockMcpTransport,
@@ -44,6 +46,7 @@ pub use skill::{LearnSkillTool, SkillRegistry};
 /// Returns a default registry of core KAI tools configured for local execution.
 pub fn default_tools() -> Vec<Arc<dyn kai_core::Tool>> {
     vec![
+        Arc::new(ListDirTool::new()),
         Arc::new(ReadWindowTool::new()),
         Arc::new(ApplyPatchTool::new()),
         Arc::new(ExecCommandTool::new()),
@@ -62,9 +65,10 @@ mod tests {
     #[test]
     fn test_default_tools_registry() {
         let tools = default_tools();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
 
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(names.contains(&"list_dir"));
         assert!(names.contains(&"read_window"));
         assert!(names.contains(&"apply_patch"));
         assert!(names.contains(&"exec_command"));
