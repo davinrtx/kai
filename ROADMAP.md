@@ -128,3 +128,20 @@ Deliver autonomous conversational engineering REPL, multi-protocol local inferen
   * Zero local compilation dependencies; automated builds strictly verified offline.
   * 100% panic-free production code with zero unwrap or expect calls.
   * Complete workspace passes Definition of Done with 199/199 passing tests.
+
+---
+
+## v0.7.0 - Semantic Output Compression & Native Directory Inspection
+
+Deliver semantic command output noise reduction, token optimization, and native directory exploration.
+
+* **Target Crates:** `kai-core`, `kai-context`, `kai-tools`, `kai-orchestrator`, `kai-cli`
+* **Status:** Completed
+* **Deliverables:**
+  * `CommandOutputCompressor` contract and `SemanticCommandCompressor` engine (cargo, git, test runners, generic ANSI).
+  * Native `ListDirTool` (`list_dir`) for bounded, deterministic, read-only directory exploration.
+  * Resilient terminal UI restoration, non-terminating Ctrl+C cancellation, UTF-8 console codepages, and tool-fallback inference handling.
+* **Acceptance Criteria:**
+  * Output compression reduces token overhead on CLI diagnostics by 60-85%.
+  * Native `list_dir` eliminates shell subprocess invocations for directory exploration.
+  * Complete workspace passes Definition of Done with zero clippy warnings and zero test failures.

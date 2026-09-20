@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-20
+
+### Added
+- `kai-core`: Defined `CommandOutputCompressor` trait and extended `ToolContext` with optional compression engine accessors.
+- `kai-context`: Implemented `SemanticCommandCompressor` with specialized semantic filters for `cargo` (test, check, build, clippy), `git` (status, diff, log), test runners (`pytest`, `jest`, `vitest`, `go test`), and ANSI terminal sanitization.
+- `kai-tools`: Implemented bounded native directory listing tool `ListDirTool` (`list_dir`) with strict 50-entry truncation cap, deterministic sorting (subdirectories first, then files), and file size metadata.
+- `kai-tools`: Integrated `CommandOutputCompressor` into `ExecCommandTool` for automatic token reduction on command outputs.
+- `kai-tools`: Added `ListDirTool` to `default_tools()` registry.
+- `kai-orchestrator`: Wired `CommandOutputCompressor` into `OrchestrationEngine` turn loop.
+- `kai-cli`: Attached `SemanticCommandCompressor` across `chat`, `run`, and `daemon` commands.
+- `kai-cli`: Added system prompt directives prioritizing native filesystem inspection tools (`list_dir`, `read_window`) over shell command execution.
+- `kai-cli`: Hardened interactive REPL with non-terminating OS-level Ctrl+C signal handling, Windows console UTF-8 code page enforcement, and model compatibility tool fallbacks.
+
+### Fixed
+- `kai-cli`: Restored Krill ASCII art emblem and solid line box-drawing UI glyphs.
+- `kai-cli`: Replaced Braille spinner frames with universal ASCII characters to eliminate `?` rendering artifacts on Windows consoles without specialized Unicode fonts.
+- `kai-cli`: Resolved autocomplete panic on empty prompts and trimmed input edge cases.
+
 ## [0.6.4] - 2026-09-19
 
 ### Fixed
