@@ -125,6 +125,14 @@ impl WorktreeScope for EphemeralWorktreeHandle {
     }
 
     fn generate_proposal(&self) -> Result<WorkspaceProposal> {
+        // Stage intent-to-add for untracked files so git diff HEAD captures newly added files
+        let _ = std::process::Command::new("git")
+            .arg("add")
+            .arg("-N")
+            .arg(".")
+            .current_dir(&self.path)
+            .output();
+
         let stat_output = std::process::Command::new("git")
             .arg("diff")
             .arg("--stat")
@@ -195,12 +203,13 @@ impl WorkspaceManager for GitWorkspaceManager {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
 
-            // Resolve target commit SHA
-            let rev_output = std::process::Command::new("git")
+            // Resolve target commit SHA asynchronously without blocking worker threads
+            let rev_output = tokio::process::Command::new("git")
                 .arg("rev-parse")
                 .arg(commit_ish)
                 .current_dir(&self.repo_root)
                 .output()
+                .await
                 .map_err(|e| {
                     KaiError::Orchestrator(OrchestratorError::SubAgentFailed {
                         agent_id: agent_id.to_string(),
@@ -220,8 +229,8 @@ impl WorkspaceManager for GitWorkspaceManager {
                 .trim()
                 .to_string();
 
-            // Spawn detached git worktree
-            let wt_output = std::process::Command::new("git")
+            // Spawn detached git worktree asynchronously
+            let wt_output = tokio::process::Command::new("git")
                 .arg("worktree")
                 .arg("add")
                 .arg("--detach")
@@ -229,6 +238,7 @@ impl WorkspaceManager for GitWorkspaceManager {
                 .arg(&base_commit)
                 .current_dir(&self.repo_root)
                 .output()
+                .await
                 .map_err(|e| {
                     KaiError::Orchestrator(OrchestratorError::SubAgentFailed {
                         agent_id: agent_id.to_string(),

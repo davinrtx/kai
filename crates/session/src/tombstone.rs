@@ -61,10 +61,12 @@ impl TombstoneCoordinator {
         for node in history {
             let text = node.message.text_content();
             if text.contains(TOMBSTONE_TAG) {
-                if let Some(json_start) = text.find("```json\n") {
-                    let json_payload = &text[json_start + 8..];
-                    if let Some(json_end) = json_payload.find("\n```") {
-                        let json_str = &json_payload[..json_end];
+                if let Some(marker_idx) = text.find("```json") {
+                    let after_marker = &text[marker_idx + 7..];
+                    let payload_start = after_marker.find('\n').map(|idx| idx + 1).unwrap_or(0);
+                    let json_payload = &after_marker[payload_start..];
+                    if let Some(json_end) = json_payload.find("```") {
+                        let json_str = json_payload[..json_end].trim();
                         if let Ok(tombstone) = serde_json::from_str::<FailureTombstone>(json_str) {
                             tombstones.push(tombstone);
                             continue;
@@ -153,5 +155,35 @@ mod tests {
         let constraints = TombstoneCoordinator::format_negative_constraints(&tombstones);
         assert!(constraints.contains("NEGATIVE CONSTRAINTS"));
         assert!(constraints.contains("SEARCH/REPLACE"));
+    }
+
+    #[tokio::test]
+    async fn test_crlf_tombstone_parsing() {
+        let store = MemorySessionStore::new();
+
+        let tombstone = FailureTombstone::new(
+            "feat/crlf",
+            "step_crlf",
+            "crlf test action",
+            "line endings error",
+            "crlf vs lf mismatch",
+        );
+        let serialized_json = serde_json::to_string(&tombstone).unwrap();
+        // Construct message explicitly using CRLF line endings
+        let crlf_content = format!(
+            "{TOMBSTONE_TAG}\r\n{}\r\n```json\r\n{}\r\n```",
+            tombstone.format_as_negative_prompt(),
+            serialized_json
+        );
+
+        let node = SessionNode::root("crlf_node", Message::system("msg_crlf", crlf_content), 2000);
+        store.put_node(&node).await.unwrap();
+
+        let tombstones = TombstoneCoordinator::collect_tombstones(&store, "crlf_node")
+            .await
+            .unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].failed_node_id, "step_crlf");
+        assert_eq!(tombstones[0].trigger_action, "crlf test action");
     }
 }

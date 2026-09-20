@@ -73,10 +73,35 @@ impl Drop for ProcessGuard {
 #[derive(Debug, Clone, Default)]
 pub struct ExecCommandTool;
 
+/// Substrings and patterns identifying sensitive credentials that must not leak to subprocesses.
+pub const SENSITIVE_ENV_PATTERNS: &[&str] = &[
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "API_KEY",
+    "TOKEN",
+    "PRIVATE_KEY",
+    "AUTH",
+    "DATABASE_URL",
+    "CREDENTIAL",
+];
+
 impl ExecCommandTool {
     /// Constructs a new [`ExecCommandTool`].
     pub fn new() -> Self {
         Self
+    }
+
+    /// Determines whether an environment variable key corresponds to sensitive host credentials.
+    pub fn is_sensitive_env_var(key: &str) -> bool {
+        let upper = key.to_ascii_uppercase();
+        SENSITIVE_ENV_PATTERNS.iter().any(|pat| upper.contains(pat))
+            || upper.starts_with("SSH_")
+            || upper.starts_with("AWS_")
+            || upper.starts_with("GITHUB_")
+            || upper.starts_with("KAI_API_")
+            || upper.starts_with("OPENAI_")
+            || upper.starts_with("ANTHROPIC_")
     }
 
     /// Resolves the working directory for command execution.
@@ -216,11 +241,19 @@ impl Tool for ExecCommandTool {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
+            // Scrub sensitive host environment variables from child process
+            for (key, _) in std::env::vars() {
+                if Self::is_sensitive_env_var(&key) {
+                    cmd.env_remove(&key);
+                }
+            }
+
             // Enforce non-interactive environment flags
             cmd.env("CI", "1")
                 .env("TERM", "dumb")
                 .env("DEBIAN_FRONTEND", "noninteractive");
 
+            // Explicit custom env overrides scrubbed defaults
             if let Some(envs) = args.env {
                 for (k, v) in envs {
                     cmd.env(k, v);
@@ -346,5 +379,30 @@ impl Tool for ExecCommandTool {
 
             Ok(tool_result)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_sensitive_env_var_detection() {
+        assert!(ExecCommandTool::is_sensitive_env_var("OPENAI_API_KEY"));
+        assert!(ExecCommandTool::is_sensitive_env_var("ANTHROPIC_API_KEY"));
+        assert!(ExecCommandTool::is_sensitive_env_var(
+            "AWS_SECRET_ACCESS_KEY"
+        ));
+        assert!(ExecCommandTool::is_sensitive_env_var("GITHUB_TOKEN"));
+        assert!(ExecCommandTool::is_sensitive_env_var("SSH_AUTH_SOCK"));
+        assert!(ExecCommandTool::is_sensitive_env_var("DATABASE_URL"));
+        assert!(ExecCommandTool::is_sensitive_env_var("MY_PASSWORD"));
+        assert!(ExecCommandTool::is_sensitive_env_var("KAI_API_SECRET"));
+
+        // Safe variables
+        assert!(!ExecCommandTool::is_sensitive_env_var("PATH"));
+        assert!(!ExecCommandTool::is_sensitive_env_var("HOME"));
+        assert!(!ExecCommandTool::is_sensitive_env_var("USER"));
+        assert!(!ExecCommandTool::is_sensitive_env_var("CARGO_HOME"));
     }
 }

@@ -122,6 +122,12 @@ impl FuzzyBlockPatcher {
         prev_row[n]
     }
 
+    /// Extracts the leading whitespace (spaces and tabs) from a line.
+    pub fn leading_indentation(s: &str) -> &str {
+        let trimmed_len = s.trim_start_matches([' ', '\t']).len();
+        &s[..s.len() - trimmed_len]
+    }
+
     /// Normalizes lines by stripping leading/trailing whitespace and normalizing CRLF.
     fn normalize_lines(text: &str) -> Vec<String> {
         text.lines().map(|l| l.trim().to_string()).collect()
@@ -176,6 +182,10 @@ impl CodePatcher for FuzzyBlockPatcher {
             });
         }
 
+        let is_crlf = content.contains("\r\n");
+        let line_sep = if is_crlf { "\r\n" } else { "\n" };
+        let has_trailing_newline = content.ends_with('\n');
+
         let mut current_text = content.to_string();
         let mut applied_count = 0;
         let mut total_confidence = 0.0;
@@ -193,12 +203,30 @@ impl CodePatcher for FuzzyBlockPatcher {
                 }));
             }
 
+            // Normalize line endings in search and replace blocks to match target content
+            let normalized_search = if is_crlf && !block.search.contains("\r\n") {
+                block.search.replace('\n', "\r\n")
+            } else if !is_crlf && block.search.contains("\r\n") {
+                block.search.replace("\r\n", "\n")
+            } else {
+                block.search.clone()
+            };
+
+            let normalized_replace = if is_crlf && !block.replace.contains("\r\n") {
+                block.replace.replace('\n', "\r\n")
+            } else if !is_crlf && block.replace.contains("\r\n") {
+                block.replace.replace("\r\n", "\n")
+            } else {
+                block.replace.clone()
+            };
+
             // Tier 1: Exact substring match
-            if let Some(pos) = current_text.find(&block.search) {
-                let mut updated = String::with_capacity(current_text.len() + block.replace.len());
+            if let Some(pos) = current_text.find(&normalized_search) {
+                let mut updated =
+                    String::with_capacity(current_text.len() + normalized_replace.len());
                 updated.push_str(&current_text[..pos]);
-                updated.push_str(&block.replace);
-                updated.push_str(&current_text[pos + block.search.len()..]);
+                updated.push_str(&normalized_replace);
+                updated.push_str(&current_text[pos + normalized_search.len()..]);
                 current_text = updated;
                 applied_count += 1;
                 total_confidence += 1.0;
@@ -244,20 +272,64 @@ impl CodePatcher for FuzzyBlockPatcher {
 
             if let Some((match_start_line, score)) = best_match {
                 let raw_lines: Vec<&str> = current_text.lines().collect();
-                let mut reconstructed = String::new();
 
+                // Compute base indentation delta between matched file context and search block
+                let file_base_indent = raw_lines[match_start_line..match_start_line + search_len]
+                    .iter()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| Self::leading_indentation(l))
+                    .unwrap_or("");
+
+                let search_base_indent = block
+                    .search
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .map(Self::leading_indentation)
+                    .unwrap_or("");
+
+                let (indent_delta, strip_prefix) = if let Some(stripped) =
+                    file_base_indent.strip_prefix(search_base_indent)
+                {
+                    (stripped, "")
+                } else if let Some(stripped) = search_base_indent.strip_prefix(file_base_indent) {
+                    ("", stripped)
+                } else if search_base_indent.is_empty() {
+                    (file_base_indent, "")
+                } else {
+                    ("", "")
+                };
+
+                let replace_lines: Vec<&str> = block.replace.lines().collect();
+                let adjusted_replace_lines: Vec<String> = replace_lines
+                    .into_iter()
+                    .map(|l| {
+                        if l.trim().is_empty() {
+                            String::new()
+                        } else if !indent_delta.is_empty() {
+                            format!("{indent_delta}{l}")
+                        } else if !strip_prefix.is_empty() && l.starts_with(strip_prefix) {
+                            l[strip_prefix.len()..].to_string()
+                        } else {
+                            l.to_string()
+                        }
+                    })
+                    .collect();
+
+                let mut output_lines =
+                    Vec::with_capacity(raw_lines.len() + adjusted_replace_lines.len());
                 for (idx, line) in raw_lines.iter().enumerate() {
                     if idx == match_start_line {
-                        reconstructed.push_str(&block.replace);
-                        if !block.replace.ends_with('\n') && idx + search_len < raw_lines.len() {
-                            reconstructed.push('\n');
-                        }
+                        output_lines.extend(adjusted_replace_lines.clone());
                     } else if idx > match_start_line && idx < match_start_line + search_len {
                         continue;
                     } else {
-                        reconstructed.push_str(line);
-                        reconstructed.push('\n');
+                        output_lines.push(line.to_string());
                     }
+                }
+
+                let mut reconstructed = output_lines.join(line_sep);
+                if has_trailing_newline && !reconstructed.is_empty() {
+                    reconstructed.push_str(line_sep);
                 }
 
                 current_text = reconstructed;
@@ -326,7 +398,40 @@ mod tests {
             .unwrap();
         assert_eq!(res.applied_count, 1);
         assert!(res.confidence_score >= 0.85);
-        assert!(res.modified_content.contains("let x = 15;"));
+        // Indentation adaptation preserves the 4 spaces from original context
+        assert!(res.modified_content.contains("    let x = 15;"));
+        assert!(res.modified_content.contains("    let y = 25;"));
+    }
+
+    #[test]
+    fn test_crlf_preservation() {
+        let patcher = FuzzyBlockPatcher::default();
+        let content = "line 1\r\nline 2\r\nline 3\r\n";
+        let blocks = vec![PatchBlock::new("line 2", "line 2 modified")];
+
+        let res = patcher
+            .apply_blocks(Path::new("crlf.txt"), content, &blocks)
+            .unwrap();
+        assert_eq!(res.applied_count, 1);
+        assert!(res.modified_content.contains("\r\n"));
+        assert_eq!(
+            res.modified_content,
+            "line 1\r\nline 2 modified\r\nline 3\r\n"
+        );
+    }
+
+    #[test]
+    fn test_no_trailing_newline_preserved() {
+        let patcher = FuzzyBlockPatcher::default();
+        let content = "first\nsecond";
+        let blocks = vec![PatchBlock::new("second", "second_changed")];
+
+        let res = patcher
+            .apply_blocks(Path::new("no_nl.txt"), content, &blocks)
+            .unwrap();
+        assert_eq!(res.applied_count, 1);
+        assert_eq!(res.modified_content, "first\nsecond_changed");
+        assert!(!res.modified_content.ends_with('\n'));
     }
 
     #[test]
